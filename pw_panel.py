@@ -216,13 +216,14 @@ class Router:
         d = self.luci_json("connect_status", {"type": typ, "url": url}, timeout=25)
         if not isinstance(d, dict):
             return {"ok": None, "ms": None}
-        ok = bool(d.get("status"))
+        # 新版 PassWall 只在通的时候返回 use_time（没有 status 字段）；老版本返回 status=true
         ms = d.get("use_time")
         try:
-            ms = round(float(ms)) if ms not in (None, "") else None
-        except ValueError:
+            ms = float(ms) if ms not in (None, "") else None
+        except (TypeError, ValueError):
             ms = None
-        return {"ok": ok, "ms": ms if ok else None}
+        ok = bool(d.get("status")) or (ms is not None and ms > 0)
+        return {"ok": ok, "ms": max(1, round(ms)) if ok and ms else None}
 
     def test_node(self, n):
         # 新版 PassWall：真实代理测速
@@ -250,12 +251,13 @@ class Router:
         cfg = self.cfg or self.load_config()
         self.node(nid)
         done = False
-        if self.app == "passwall":
-            try:
-                self.luci("set_node", {"protocol": "tcp", "section": nid}, timeout=60)
-                done = self.load_config()["current"] == nid
-            except NETERR:
-                done = False
+        # 新版参数：type/config/section；老版 PassWall 1：protocol/section。一起带上，两种都认
+        try:
+            self.luci("set_node", {"type": "@global[0]", "config": cfg["opt"], "protocol": "tcp",
+                                   "section": nid}, timeout=60)
+            done = self.load_config()["current"] == nid
+        except NETERR:
+            done = False
         if not done:
             self.ubus("uci", "set", {"config": self.app, "section": cfg["global_section"],
                                      "values": {cfg["opt"]: nid}})
