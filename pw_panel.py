@@ -317,6 +317,26 @@ class Router:
                 return {"ok": bool(p), "ms": round(p) if p else None, "kind": "TCP"}
         return {"ok": None, "ms": None, "kind": "无法测"}
 
+    def ping_ip(self):
+        """不靠域名、直接 ping 公共 DNS 的 IP，判断是不是只有 DNS 坏了"""
+        for ip in ("223.5.5.5", "114.114.114.114"):
+            try:
+                d = self.luci_json("ping_node", {"index": 0, "address": ip, "port": 80, "type": "icmp"}, timeout=15)
+            except NETERR:
+                continue
+            if isinstance(d, dict) and str(d.get("ping") or "").strip():
+                return True
+            if not isinstance(d, dict):
+                return None
+        return False
+
+    def restart(self):
+        app = self.app or (self.cfg or self.load_config())["app"]
+        try:
+            self.ubus("rc", "init", {"name": app, "action": "restart"}, timeout=90)
+        except Err:
+            self.ubus("file", "exec", {"command": f"/etc/init.d/{app}", "params": ["restart"]}, timeout=90)
+
     def switch(self, nid):
         cfg = self.cfg or self.load_config()
         self.node(nid)
@@ -422,7 +442,10 @@ def check_router(r):
         if g:
             s.update(level="ok", msg="")
         elif b is False:
-            s.update(level="no_wan", msg="国内网站也打不开：盒子本身没网，查宽带或上级路由")
+            if c.ping_ip():
+                s.update(level="dns_bad", msg="能 ping 通 IP 但域名解析失败：DNS 坏了，客户会打不开网页。先试「重启PassWall」，不行再查上级路由的 DNS")
+            else:
+                s.update(level="no_wan", msg="国内网站和 IP 都不通：盒子本身没网，查宽带或上级路由")
         elif not cfg["enabled"]:
             s.update(level="disabled", msg="PassWall 总开关没开")
         elif g is None:
@@ -456,7 +479,7 @@ def notify(text):
     threading.Thread(target=run, daemon=True).start()
 
 
-LEVEL_TEXT = {"ok": "正常", "node_bad": "节点异常", "no_wan": "盒子没网", "disabled": "PassWall 未开",
+LEVEL_TEXT = {"ok": "正常", "node_bad": "节点异常", "dns_bad": "DNS坏了", "no_wan": "盒子没网", "disabled": "PassWall 未开",
               "offline": "离线", "error": "出错"}
 
 
@@ -595,7 +618,10 @@ def api_autofix(b):
         return {"fixed": True, "log": log}
     log.append("当前节点外网不通。")
     if c.connect_test(DOMESTIC_URL, "baidu")["ok"] is False:
-        log.append("国内网站也打不开 → 是盒子本身没网，换节点没用，请查宽带或上级路由。")
+        if c.ping_ip():
+            log.append("国内网站也打不开，但能 ping 通 IP → DNS 坏了，换节点没用。请点「重启PassWall」，不行再查上级路由 DNS。")
+        else:
+            log.append("国内网站和 IP 都不通 → 盒子本身没网，换节点没用，请查宽带或上级路由。")
         return {"fixed": False, "log": log}
     if not cfg["enabled"]:
         log.append("PassWall 总开关没开，请到后台打开。")
@@ -637,6 +663,19 @@ def api_autofix(b):
     check_many([r["id"]])
     log.append("自动修复没成功，请到后台手动看看。")
     return {"fixed": False, "log": log}
+
+
+def api_restart(b):
+    r = get_router(b["id"])
+    c = client_for(b)
+    c.load_config()
+    try:
+        c.restart()
+    except NETERR:
+        pass  # 重启时连接被断开是正常的
+    time.sleep(5)
+    check_many([r["id"]])
+    return {"status": STATUS.get(r["id"])}
 
 
 def api_router_save(b):
@@ -746,7 +785,7 @@ def api_test_notify(_):
 
 POST_ROUTES = {
     "/api/check": api_check, "/api/nodes": api_nodes, "/api/test_node": api_test_node,
-    "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix,
+    "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart,
     "/api/router/save": api_router_save, "/api/router/delete": api_router_delete,
     "/api/frps/scan": api_frps_scan, "/api/router/bulk_add": api_bulk_add,
     "/api/settings/save": api_settings_save, "/api/settings/test_notify": api_test_notify,
@@ -858,8 +897,8 @@ tr:last-child td{border-bottom:0}th,td:first-child,.nw{white-space:nowrap}.muted
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const LV={ok:["正常","ok"],node_bad:["节点异常","bad"],error:["出错","bad"],no_wan:["盒子没网","warn"],disabled:["PassWall未开","warn"],offline:["离线","off"],none:["未检测","off"]};
-const ORD={node_bad:0,error:1,no_wan:2,disabled:3,offline:4,none:5,ok:6};
+const LV={ok:["正常","ok"],node_bad:["节点异常","bad"],error:["出错","bad"],dns_bad:["DNS坏了","bad"],no_wan:["盒子没网","warn"],disabled:["PassWall未开","warn"],offline:["离线","off"],none:["未检测","off"]};
+const ORD={node_bad:0,dns_bad:0.5,error:1,no_wan:2,disabled:3,offline:4,none:5,ok:6};
 let S={routers:[]},FILTER=null,NODES=null;
 async function api(p,b){const o=b===undefined?{}:{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)};
  const r=await fetch(p,o);const j=await r.json();if(b!==undefined&&!j.ok)throw new Error(j.error||"失败");return j}
@@ -892,6 +931,7 @@ function render(){
   <td>${net(s.google)}</td><td class="hide-m">${net(s.baidu)}</td><td class="hide-m muted small nw">${ago(s.time)}</td>
   <td><div class="ops"><button class="sm" onclick="checkOne('${r.id}',this)">检测</button><button class="sm" onclick="openNodes('${r.id}')">节点</button>
   ${l==="node_bad"?`<button class="sm pri" onclick="autofix('${r.id}')">一键修复</button>`:""}
+  ${l==="dns_bad"?`<button class="sm pri" onclick="restartPW('${r.id}',this)">重启PassWall</button>`:""}
   <a href="${esc(r.luci_url)}" target="_blank"><button class="sm">后台</button></a><button class="sm" onclick="editRouter('${r.id}')">编辑</button></div></td></tr>`}).join("")+"</tbody></table>"}
 async function checkAll(){$("btnAll").disabled=true;$("btnAll").textContent="检测中…";try{S=await api("/api/check",{});render();toast("全部检测完成")}catch(e){toast(e.message);load()}}
 async function checkOne(id,btn){btn.disabled=true;btn.textContent="…";try{S=await api("/api/check",{id});render()}catch(e){toast(e.message)}finally{btn.disabled=false;btn.textContent="检测"}}
@@ -900,7 +940,7 @@ async function openNodes(id){openM(R(id).name+" · 节点",'<p class="muted">正
  try{const d=await api("/api/nodes",{id});NODES={id,...d,lat:{}};renderNodes()}catch(e){$("mb").innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
 function renderNodes(){if(!NODES)return;const d=NODES;
  $("mb").innerHTML=`<div style="display:flex;gap:8px;align-items:center;margin-bottom:10px"><span class="muted">${esc(d.app)} · 总开关${d.enabled?'<span class="ok">已开</span>':'<span class="bad">未开</span>'} · ${d.nodes.length} 个节点</span>
- <button class="sm" style="margin-left:auto" onclick="testAll(this)">全部测速</button></div>
+ <button class="sm" style="margin-left:auto" onclick="restartPW(NODES.id,this)">重启PassWall</button><button class="sm" onclick="testAll(this)">全部测速</button></div>
  <table><thead><tr><th>节点</th><th class="hide-m">类型</th><th class="hide-m">地址</th><th>延迟</th><th></th></tr></thead><tbody>`+
  d.nodes.map(n=>{const c=n.id===d.current,t=d.lat[n.id];
   return `<tr class="${c?"cur":""}"><td>${c?'<span class="tag">当前</span> ':""}${esc(n.remarks)}</td><td class="hide-m muted small">${esc(n.type)} ${esc(n.protocol)}</td>
@@ -922,6 +962,10 @@ async function addLink(btn){const link=$("link").value.trim();if(!link)return to
  try{const r=await api("/api/add_link",{id,link,switch:$("sw").checked});const g=r.status&&r.status.google;
   toast("已添加："+r.added.map(x=>x.remarks).join("、")+(r.status?(g&&g.ok?`，已切换，外网正常 ${g.ms}ms`:"，已切换，但外网还是不通"):""),6000);await load();openNodes(id)}
  catch(e){toast(e.message,6000);btn.disabled=false;btn.textContent="添加节点"}}
+async function restartPW(id,btn){if(!confirm(`重启「${R(id).name}」的 PassWall？客户会断网十几秒。`))return;
+ const t=btn?btn.textContent:"";if(btn){btn.disabled=true;btn.textContent="重启中…"}
+ try{const r=await api("/api/restart",{id});const st=r.status||{};toast(st.level==="ok"?"重启完成，已恢复正常":"重启完成，当前状态："+(LV[st.level]||["?"])[0],5000);await load();if(NODES&&NODES.id===id)openNodes(id)}
+ catch(e){toast(e.message,5000)}finally{if(btn){btn.disabled=false;btn.textContent=t}}}
 async function autofix(id){openM(R(id).name+" · 一键修复",'<div class="log" id="flog">正在检测当前网络，并给备用节点测速、切换，可能要 1~2 分钟…</div>');
  try{const r=await api("/api/autofix",{id});$("flog").textContent=r.log.join("\n");if(!r.fixed)$("mb").insertAdjacentHTML("beforeend",`<div style="margin-top:10px"><button class="pri" onclick="openNodes('${id}')">打开节点列表 / 添加新节点</button></div>`);load()}
  catch(e){$("flog").textContent="出错："+e.message}}
