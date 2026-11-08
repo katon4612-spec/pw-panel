@@ -21,6 +21,19 @@ LOCK = threading.RLock()
 STATUS = {}            # router_id -> 最近一次检测结果
 LAST_FULL = {"time": None, "running": False}
 NETERR = (OSError, http.client.HTTPException)
+# 网址里同时带 baidu 和 aliyun：老版 PassWall 认 baidu、新版认 aliyun 为“直连测试”
+DOMESTIC_URL = "https://www.baidu.com/?from=aliyun"
+
+
+def neterr_text(e):
+    t = str(e) or type(e).__name__
+    if "timed out" in t or isinstance(e, socket.timeout):
+        return "超时"
+    if "refused" in t:
+        return "端口拒绝连接"
+    if "reset" in t or "Remote end closed" in t or "RemoteDisconnected" in type(e).__name__:
+        return "连接被断开"
+    return t[:60]
 
 DEFAULT_CONFIG = {
     "listen_host": "0.0.0.0",
@@ -125,8 +138,15 @@ class Router:
 
     def login(self):
         body = urllib.parse.urlencode({"luci_username": self.user, "luci_password": self.pw})
-        st, hdrs, data = self.req("POST", "/cgi-bin/luci/", body,
-                                  {"Content-Type": "application/x-www-form-urlencoded"}, timeout=12)
+        for attempt in range(3):
+            try:
+                st, hdrs, data = self.req("POST", "/cgi-bin/luci/", body,
+                                          {"Content-Type": "application/x-www-form-urlencoded"}, timeout=20)
+                break
+            except NETERR:
+                if attempt == 2:
+                    raise
+                time.sleep(2)
         for k, v in hdrs:
             kl = k.lower()
             if kl == "set-cookie" and not self.sid:
@@ -213,7 +233,11 @@ class Router:
         raise Err("节点不存在（可能已被删掉）")
 
     def connect_test(self, url, typ):
-        d = self.luci_json("connect_status", {"type": typ, "url": url}, timeout=25)
+        try:
+            d = self.luci_json("connect_status", {"type": typ, "url": url}, timeout=30)
+        except NETERR:
+            time.sleep(2)
+            d = self.luci_json("connect_status", {"type": typ, "url": url}, timeout=30)
         if not isinstance(d, dict):
             return {"ok": None, "ms": None}
         # 新版 PassWall 只在通的时候返回 use_time（没有 status 字段）；老版本返回 status=true
@@ -334,8 +358,8 @@ def check_router(r):
     except Err as e:
         s["msg"] = str(e)
         return s
-    except NETERR:
-        s.update(level="offline", msg="连不上盒子后台（盒子断电/断网，或 frp 掉线）")
+    except NETERR as e:
+        s.update(level="offline", msg=f"连不上盒子后台（{neterr_text(e)}）：盒子断电/断网，或 frp 掉线")
         return s
     try:
         cfg = c.load_config()
@@ -343,7 +367,7 @@ def check_router(r):
         cur = next((n for n in cfg["nodes"] if n["id"] == cfg["current"]), None)
         s["node_name"] = cur["remarks"] if cur else (cfg["current"] or "未选择")
         s["google"] = c.connect_test(CFG.get("test_url") or DEFAULT_CONFIG["test_url"], "google")
-        s["baidu"] = c.connect_test("https://www.baidu.com", "baidu")
+        s["baidu"] = c.connect_test(DOMESTIC_URL, "baidu")
         g, b = s["google"]["ok"], s["baidu"]["ok"]
         if g:
             s.update(level="ok", msg="")
@@ -357,8 +381,8 @@ def check_router(r):
             s.update(level="node_bad", msg="国内正常、外网不通：当前节点有问题，建议切换")
     except Err as e:
         s["msg"] = str(e)
-    except NETERR:
-        s.update(level="offline", msg="检测过程中连接断了")
+    except NETERR as e:
+        s.update(level="error", msg=f"登录成功但检测中途失败（{neterr_text(e)}），盒子可能太卡，稍后点「检测」重试")
     return s
 
 
@@ -391,7 +415,7 @@ def check_many(ids=None):
     if not routers:
         return
     fm = frps_map()
-    with ThreadPoolExecutor(max_workers=16) as ex:
+    with ThreadPoolExecutor(max_workers=8) as ex:
         results = list(ex.map(check_router, routers))
     alerts = []
     for r, s in zip(routers, results):
@@ -517,7 +541,7 @@ def api_autofix(b):
         check_many([r["id"]])
         return {"fixed": True, "log": log}
     log.append("当前节点外网不通。")
-    if c.connect_test("https://www.baidu.com", "baidu")["ok"] is False:
+    if c.connect_test(DOMESTIC_URL, "baidu")["ok"] is False:
         log.append("国内网站也打不开 → 是盒子本身没网，换节点没用，请查宽带或上级路由。")
         return {"fixed": False, "log": log}
     if not cfg["enabled"]:
