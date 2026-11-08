@@ -233,6 +233,19 @@ class Router:
         raise Err("节点不存在（可能已被删掉）")
 
     def connect_test(self, url, typ):
+        # 有的 PassWall 版本自己在前面拼 https://，所以要传不带协议头的网址（和它页面上一样）；
+        # 不通再用完整网址补测一次，兼容其他版本
+        bare = re.sub(r"^https?://", "", url)
+        res = None
+        for u in dict.fromkeys([bare, url]):
+            r = self._connect_once(u, typ)
+            if r["ok"]:
+                return r
+            if res is None or (res["ok"] is None and r["ok"] is not None):
+                res = r
+        return res
+
+    def _connect_once(self, url, typ):
         try:
             d = self.luci_json("connect_status", {"type": typ, "url": url}, timeout=30)
         except NETERR:
