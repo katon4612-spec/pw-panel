@@ -226,6 +226,39 @@ class Router:
                     "global_section": glob.get(".name"), "opt": opt, "nodes": nodes}
         return self.cfg
 
+    def wifi(self):
+        """读无线配置，返回 [{ssid, band, disabled}]；没有无线或读不到返回 []"""
+        try:
+            vals = self.ubus("uci", "get", {"config": "wireless"}).get("values") or {}
+        except (Err, ValueError):
+            return []
+        devs = {}
+        for k, v in vals.items():
+            if v.get(".type") == "wifi-device":
+                band = (v.get("band") or "").lower()
+                hw = (v.get("hwmode") or "").lower()
+                ch = str(v.get("channel") or "")
+                if band in ("5g", "6g", "2g"):
+                    b = {"2g": "2.4G", "5g": "5G", "6g": "6G"}[band]
+                elif hw.endswith("a") or (ch.isdigit() and int(ch) > 14):
+                    b = "5G"
+                elif hw:
+                    b = "2.4G"
+                else:
+                    b = ""
+                devs[k] = {"band": b, "disabled": v.get("disabled") == "1"}
+        out = []
+        items = sorted(((v.get(".index", 0), v) for v in vals.values() if v.get(".type") == "wifi-iface"),
+                       key=lambda x: x[0])
+        for _, v in items:
+            ssid = v.get("ssid")
+            if not ssid or (v.get("mode") or "ap") != "ap":
+                continue
+            d = devs.get(v.get("device"), {})
+            out.append({"ssid": ssid, "band": d.get("band", ""),
+                        "disabled": v.get("disabled") == "1" or d.get("disabled", False)})
+        return out
+
     def node(self, nid):
         for n in (self.cfg or self.load_config())["nodes"]:
             if n["id"] == nid:
@@ -365,7 +398,7 @@ def frps_map():
 # ---------------------------------------------------------------- 检测
 def check_router(r):
     s = {"time": time.time(), "level": "error", "msg": "", "app": None, "enabled": None,
-         "node_id": None, "node_name": None, "node_count": 0, "google": None, "baidu": None}
+         "node_id": None, "node_name": None, "node_count": 0, "google": None, "baidu": None, "wifi": None}
     try:
         c = Router(r).login()
     except Err as e:
@@ -374,6 +407,10 @@ def check_router(r):
     except NETERR as e:
         s.update(level="offline", msg=f"连不上盒子后台（{neterr_text(e)}）：盒子断电/断网，或 frp 掉线")
         return s
+    try:
+        s["wifi"] = c.wifi()
+    except NETERR:
+        pass
     try:
         cfg = c.load_config()
         s.update(app=cfg["app"], enabled=cfg["enabled"], node_id=cfg["current"], node_count=len(cfg["nodes"]))
@@ -437,7 +474,10 @@ def check_many(ids=None):
             s["frp"] = on
             if s["level"] == "offline" and on is False:
                 s["msg"] = "frp 显示离线：盒子断电/断网，或盒子上的 frpc 没运行"
-        prev = (STATUS.get(r["id"]) or {}).get("level")
+        old = STATUS.get(r["id"]) or {}
+        if s.get("wifi") is None and old.get("wifi"):
+            s["wifi"] = old["wifi"]  # 离线时保留上次读到的 WiFi 名，方便认盒子
+        prev = old.get("level")
         STATUS[r["id"]] = s
         if prev and prev != s["level"]:
             if s["level"] != "ok" and prev == "ok":
@@ -794,7 +834,7 @@ button:hover{border-color:#c9ccd2}button.pri{background:var(--pri);border-color:
 button:disabled{opacity:.5;cursor:wait}button.sm{padding:3px 9px;font-size:13px}
 main{padding:16px 20px}table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
 th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-weight:600;font-size:13px;color:var(--muted);background:#fafbfc}
-tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.small{font-size:12px}
+tr:last-child td{border-bottom:0}th,td:first-child,.nw{white-space:nowrap}.muted{color:var(--muted)}.small{font-size:12px}
 .dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.off{color:var(--off)}
 .bg-ok{background:var(--ok)}.bg-bad{background:var(--bad)}.bg-warn{background:var(--warn)}.bg-off{background:var(--off)}
 .ops{display:flex;gap:5px;flex-wrap:wrap}.tag{font-size:12px;padding:1px 7px;border-radius:5px;background:#eef2ff;color:var(--pri)}
@@ -805,11 +845,11 @@ tr:last-child td{border-bottom:0}.muted{color:var(--muted)}.small{font-size:12px
 .sec{font-weight:600;margin-top:8px;grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px}
 .log{background:#0f1218;color:#d1d5db;border-radius:8px;padding:12px;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;max-height:420px;overflow:auto}
 #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#141821;color:#fff;padding:10px 16px;border-radius:8px;opacity:0;transition:.25s;pointer-events:none;z-index:20;max-width:90vw}
-#toast.show{opacity:1}.cur{background:#f0fdf4}.empty{padding:40px;text-align:center;color:var(--muted);background:#fff;border:1px dashed var(--line);border-radius:10px}
+#toast.show{opacity:1}.cur{background:#f0fdf4}.wf{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.45}.wf.off{text-decoration:line-through}.empty{padding:40px;text-align:center;color:var(--muted);background:#fff;border:1px dashed var(--line);border-radius:10px}
 @media(max-width:760px){.hide-m{display:none}th,td{padding:7px 6px}.form{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>PassWall 节点面板</h1><div class="sum" id="sum"></div>
-<div class="actions"><input id="q" placeholder="搜索名称 / 备注 / 端口" oninput="render()" style="width:180px">
+<div class="actions"><input id="q" placeholder="搜索名称 / WiFi / 备注 / 端口" oninput="render()" style="width:180px">
 <button class="pri" id="btnAll" onclick="checkAll()">全部检测</button><button onclick="openImport()">从 frps 导入</button>
 <button onclick="editRouter()">添加盒子</button><button onclick="openSettings()">设置</button></div></header>
 <main><div class="muted small" id="meta" style="margin-bottom:8px"></div><div id="list"></div></main>
@@ -828,6 +868,10 @@ function openM(t,h){$("mt").textContent=t;$("mb").innerHTML=h;$("modal").hidden=
 function closeM(){$("modal").hidden=true;NODES=null}
 function ago(ts){if(!ts)return"—";const s=Math.round(Date.now()/1000-ts);return s<60?s+"秒前":s<3600?Math.round(s/60)+"分钟前":Math.round(s/3600)+"小时前"}
 function net(t){if(!t)return'<span class="off">—</span>';if(t.ok===null)return'<span class="off">未知</span>';return t.ok?`<span class="ok">${t.ms??"通"}${t.ms!=null?"ms":""}</span>`:'<span class="bad">不通</span>'}
+function wifiCell(w){if(w==null)return'<span class="off">—</span>';if(!w.length)return'<span class="off small">无 WiFi</span>';
+ const g={};w.forEach(x=>{const k=x.ssid+"\u0000"+(x.disabled?1:0);(g[k]=g[k]||{ssid:x.ssid,dis:x.disabled,b:[]}).b.push(x.band)});
+ return Object.values(g).sort((a,b)=>a.dis-b.dis).map(x=>{const b=[...new Set(x.b.filter(Boolean))].join("/");
+  return `<div class="wf ${x.dis?"off":""}" title="${esc(x.ssid)}">${esc(x.ssid)}${b?` <span class="muted small">${b}</span>`:""}${x.dis?' <span class="small">已关</span>':""}</div>`}).join("")}
 function lvl(r){return r.status?r.status.level:"none"}
 async function load(){try{S=await api("/api/state");render()}catch(e){}}
 function render(){
@@ -836,16 +880,16 @@ function render(){
   Object.keys(ORD).filter(k=>cnt[k]).map(k=>`<span class="chip ${FILTER===k?"on":""}" onclick="FILTER='${k}';render()"><span class="dot bg-${LV[k][1]}"></span>${LV[k][0]} ${cnt[k]}</span>`).join("");
  $("meta").textContent=(S.checking?"正在全部检测… ":"")+"上次全部检测："+ago(S.last_full)+(S.interval>0?`，每 ${S.interval} 分钟自动检测`:"，自动检测已关闭");
  $("btnAll").disabled=!!S.checking;$("btnAll").textContent=S.checking?"检测中…":"全部检测";
- let rs=S.routers.filter(r=>(!q||[r.name,r.note,r.port,r.frp_name].join(" ").toLowerCase().includes(q))&&(FILTER===null||lvl(r)===FILTER));
+ let rs=S.routers.filter(r=>(!q||[r.name,r.note,r.port,r.frp_name,...((r.status&&r.status.wifi)||[]).map(w=>w.ssid)].join(" ").toLowerCase().includes(q))&&(FILTER===null||lvl(r)===FILTER));
  rs.sort((a,b)=>(ORD[lvl(a)]-ORD[lvl(b)])||String(a.name).localeCompare(String(b.name),"zh"));
  if(!S.routers.length){$("list").innerHTML='<div class="empty">还没有盒子。先点「设置」填 frps 面板账号和后台默认密码，再点「从 frps 导入」。</div>';return}
- $("list").innerHTML=`<table><thead><tr><th>状态</th><th>盒子</th><th class="hide-m">端口</th><th class="hide-m">frp</th><th>当前节点</th><th>外网</th><th class="hide-m">国内</th><th class="hide-m">检测</th><th>操作</th></tr></thead><tbody>`+
+ $("list").innerHTML=`<table><thead><tr><th>状态</th><th>盒子</th><th>WiFi</th><th class="hide-m">端口</th><th class="hide-m">frp</th><th>当前节点</th><th>外网</th><th class="hide-m">国内</th><th class="hide-m">检测</th><th>操作</th></tr></thead><tbody>`+
  rs.map(r=>{const s=r.status||{},l=lvl(r),[lt,lc]=LV[l];
   return `<tr><td><span class="dot bg-${lc}"></span><b class="${lc}">${lt}</b></td>
   <td><b>${esc(r.name)}</b>${r.note?` <span class="muted small">${esc(r.note)}</span>`:""}${s.msg?`<div class="small ${lc}">${esc(s.msg)}</div>`:""}</td>
-  <td class="hide-m">${esc(r.port)}</td><td class="hide-m">${s.frp===true?'<span class="ok">在线</span>':s.frp===false?'<span class="bad">离线</span>':'<span class="off">—</span>'}</td>
+  <td>${wifiCell(s.wifi)}</td><td class="hide-m">${esc(r.port)}</td><td class="hide-m nw">${s.frp===true?'<span class="ok">在线</span>':s.frp===false?'<span class="bad">离线</span>':'<span class="off">—</span>'}</td>
   <td>${esc(s.node_name||"—")}${s.node_count?` <span class="muted small">共${s.node_count}个</span>`:""}</td>
-  <td>${net(s.google)}</td><td class="hide-m">${net(s.baidu)}</td><td class="hide-m muted small">${ago(s.time)}</td>
+  <td>${net(s.google)}</td><td class="hide-m">${net(s.baidu)}</td><td class="hide-m muted small nw">${ago(s.time)}</td>
   <td><div class="ops"><button class="sm" onclick="checkOne('${r.id}',this)">检测</button><button class="sm" onclick="openNodes('${r.id}')">节点</button>
   ${l==="node_bad"?`<button class="sm pri" onclick="autofix('${r.id}')">一键修复</button>`:""}
   <a href="${esc(r.luci_url)}" target="_blank"><button class="sm">后台</button></a><button class="sm" onclick="editRouter('${r.id}')">编辑</button></div></td></tr>`}).join("")+"</tbody></table>"}
