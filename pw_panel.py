@@ -462,21 +462,92 @@ class Router:
             if self.load_config()["current"] != nid:
                 raise Err("切换没生效，请到后台手动切换")
 
-    def add_link(self, link):
-        link = link.strip()
-        if not re.match(r"^(ss|ssr|vmess|vless|trojan|hysteria2?|hy2|tuic|socks5?|https?)://\S+$", link, re.I):
-            raise Err("这不像节点分享链接（应以 ss:// vmess:// vless:// trojan:// hy2:// 等开头，一次一条）")
-        if "'" in link:
-            raise Err("链接里不能有单引号")
+    @staticmethod
+    def parse_socks(line):
+        """识别 SOCKS5 写法，返回 dict 或 None：
+           host:port:user:pass / host:port / user:pass@host:port / socks5://user:pass@host:port#备注"""
+        t = line.strip()
+        remark = ""
+        if "#" in t:
+            t, remark = t.split("#", 1)
+            remark = urllib.parse.unquote(remark).strip()
+        m = re.match(r"^socks5?h?://(.+)$", t, re.I)
+        if m:
+            t = urllib.parse.unquote(m.group(1)).rstrip("/")
+        user = pw = ""
+        if "@" in t:
+            cred, hp = t.rsplit("@", 1)
+            if ":" in cred:
+                user, pw = cred.split(":", 1)
+            else:  # socks://base64(user:pass)@host:port
+                try:
+                    dec = base64.b64decode(cred + "=" * (-len(cred) % 4)).decode()
+                    user, pw = dec.split(":", 1)
+                except Exception:
+                    return None
+            parts = hp.split(":")
+            if len(parts) != 2:
+                return None
+            host, port = parts
+        else:
+            parts = t.split(":")
+            if len(parts) == 2:
+                host, port = parts
+            elif len(parts) >= 4:
+                host, port, user, pw = parts[0], parts[1], parts[2], ":".join(parts[3:])
+            else:
+                return None
+        host = host.strip().strip("[]")
+        if not port.strip().isdigit() or not (0 < int(port) < 65536):
+            return None
+        if not re.match(r"^[A-Za-z0-9.\-]+$", host):
+            return None
+        return {"address": host, "port": port.strip(), "username": user, "password": pw,
+                "remarks": remark or f"socks-{host}:{port.strip()}"}
+
+    def add_link(self, text):
+        lines = [l.strip() for l in str(text).replace("\r", "\n").split("\n") if l.strip()]
+        if not lines:
+            raise Err("先粘贴节点")
         before = {n["id"] for n in (self.cfg or self.load_config())["nodes"]}
-        self.luci("link_add_node", None, timeout=40, method="POST",
-                  data={"link": link, "chunk": link, "chunk_index": 0, "total_chunks": 1})
-        for _ in range(5):
+        socks, links = [], []
+        for l in lines:
+            if re.match(r"^(ss|ssr|vmess|vless|trojan|hysteria2?|hy2|tuic|https?)://\S+$", l, re.I):
+                if "'" in l:
+                    raise Err("链接里不能有单引号")
+                links.append(l)
+            else:
+                info = self.parse_socks(l)
+                if not info:
+                    raise Err(f"认不出这一行：{l[:60]}\n支持分享链接（ss:// vmess:// vless:// trojan:// hy2://…）"
+                              "或 SOCKS5：地址:端口:用户名:密码")
+                socks.append(info)
+        # SOCKS5 节点：直接写进 PassWall 配置（Xray + socks）
+        uci_changes = []
+        for info in socks:
+            vals = {"remarks": info["remarks"], "type": "Xray", "protocol": "socks",
+                    "address": info["address"], "port": info["port"]}
+            if info["username"] or info["password"]:
+                vals.update(username=info["username"], password=info["password"])
+            self.ubus("uci", "add", {"config": self.app, "type": "nodes", "values": vals})
+            uci_changes.append(vals)
+        if uci_changes:
+            self.uci_save(self.app)
+        # 分享链接：交给 PassWall 自己的导入功能
+        if links:
+            body = "\n".join(links)
+            self.luci("link_add_node", None, timeout=60, method="POST",
+                      data={"link": body, "chunk": body, "chunk_index": 0, "total_chunks": 1})
+        want = len(socks) + len(links)
+        new = []
+        for _ in range(8):
             time.sleep(1)
             new = [n for n in self.load_config()["nodes"] if n["id"] not in before]
-            if new:
-                return new
-        raise Err("没加上：这个 PassWall 版本可能不认这条链接，请到后台手动添加")
+            if len(new) >= want:
+                break
+        if not new:
+            raise Err("没加上：这个 PassWall 版本可能不认这条链接，请到后台手动添加")
+        return new
 
 
 # ---------------------------------------------------------------- frps
@@ -1074,7 +1145,7 @@ function renderNodes(){if(!NODES)return;const d=NODES;
   <td class="hide-m muted small">${esc(n.address)}${n.port?":"+esc(n.port):""}</td>
   <td id="lat-${n.id}">${t===undefined?'<span class="off">—</span>':t==="…"?"测速中…":t.ok?`<span class="ok">${t.ms}ms</span> <span class="muted small">${esc(t.kind)}</span>`:t.ok===null?`<span class="off">${esc(t.kind)}</span>`:'<span class="bad">不通</span>'}</td>
   <td><div class="ops"><button class="sm" onclick="testNode('${n.id}')">测速</button>${c?"":`<button class="sm pri" onclick="switchNode('${n.id}',this)">切换</button>`}</div></td></tr>`}).join("")+
- `</tbody></table><div style="margin-top:16px"><b>添加新节点</b><div class="muted small">粘贴一条节点分享链接（ss:// vmess:// vless:// trojan:// hy2:// …）</div>
+ `</tbody></table><div style="margin-top:16px"><b>添加新节点</b><div class="muted small">粘贴节点（可多行，一行一个）：分享链接 ss:// vmess:// vless:// trojan:// hy2:// …，或 SOCKS5 写法 <b>地址:端口:用户名:密码</b>（会建成 Xray 的 socks 节点）</div>
  <textarea id="link" rows="3" style="width:100%;margin-top:6px"></textarea>
  <div style="display:flex;gap:10px;align-items:center;margin-top:6px"><label><input type="checkbox" id="sw" checked> 添加后立即切换过去</label>
  <button class="pri" style="margin-left:auto" onclick="addLink(this)">添加节点</button></div></div>`}
