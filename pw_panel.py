@@ -775,6 +775,7 @@ def check_many(ids=None):
             s["wifi"] = old["wifi"]  # 离线时保留上次读到的 WiFi 名，方便认盒子
         prev = old.get("level")
         STATUS[r["id"]] = s
+        maybe_auto_switch(r, s)
         if prev and prev != s["level"]:
             if s["level"] != "ok" and prev == "ok":
                 alerts.append(f"❌ {r['name']}：{LEVEL_TEXT.get(s['level'])}。{s['msg']}")
@@ -784,6 +785,43 @@ def check_many(ids=None):
         LAST_FULL["time"] = time.time()
     if alerts:
         notify("PassWall 面板提醒\n" + "\n".join(alerts))
+
+
+AUTO_RUNNING = set()
+AUTO_LAST = {}      # router_id -> 上次自动切换开始时间
+AUTO_LOG = {}       # router_id -> {"time","fixed","text"}
+AUTO_COOLDOWN = 600
+
+
+def maybe_auto_switch(r, s):
+    rid = r["id"]
+    if not r.get("auto_switch") or s.get("level") != "node_bad":
+        return
+    if rid in AUTO_RUNNING or time.time() - AUTO_LAST.get(rid, 0) < AUTO_COOLDOWN:
+        return
+    AUTO_RUNNING.add(rid)
+    AUTO_LAST[rid] = time.time()
+    s["msg"] = "节点异常，正在自动切换…"
+
+    def run():
+        try:
+            old = s.get("node_name") or ""
+            res = autofix_core(r, wait_first=20)
+            last = res["log"][-1] if res["log"] else ""
+            if res.get("to"):
+                text = f"已自动从「{old}」切换到「{res['to']}」。{last}"
+            elif res["fixed"]:
+                text = "复查时当前节点已恢复，没有切换"
+            else:
+                text = "自动切换失败：" + last
+            AUTO_LOG[rid] = {"time": time.time(), "fixed": res["fixed"], "text": text}
+            if res.get("to") or not res["fixed"]:
+                notify(f"PassWall 面板 · 自动切换\n{'✅' if res['fixed'] else '❌'} {r['name']}：{text}")
+        except Exception as e:
+            AUTO_LOG[rid] = {"time": time.time(), "fixed": False, "text": f"自动切换出错：{e}"}
+        finally:
+            AUTO_RUNNING.discard(rid)
+    threading.Thread(target=run, daemon=True).start()
 
 
 def bg_loop():
@@ -808,6 +846,9 @@ def pub_router(r):
     st = STATUS.get(r["id"])
     x["status"] = st
     x["luci_url"] = r_url(r, st and st.get("app"))
+    x["auto_switch"] = bool(r.get("auto_switch"))
+    x["auto_running"] = r["id"] in AUTO_RUNNING
+    x["auto_log"] = AUTO_LOG.get(r["id"])
     x["host_eff"] = r_host(r)
     return x
 
@@ -903,10 +944,18 @@ def api_add_link(b):
 
 
 def api_autofix(b):
-    r = get_router(b["id"])
-    c = client_for(b)
+    return autofix_core(get_router(b["id"]))
+
+
+def autofix_core(r, wait_first=0):
+    try:
+        c = Router(r).login()
+    except NETERR:
+        raise Err("连不上盒子后台（盒子离线或 frp 掉线）")
     cfg = c.load_config()
     log = []
+    if wait_first:
+        time.sleep(wait_first)
     url = CFG.get("test_url") or DEFAULT_CONFIG["test_url"]
     g = c.connect_test(url, "google")
     if g["ok"]:
@@ -955,7 +1004,7 @@ def api_autofix(b):
         if g["ok"]:
             log.append(f"✅ 已恢复，外网 {g['ms']}ms")
             check_many([r["id"]])
-            return {"fixed": True, "log": log}
+            return {"fixed": True, "log": log, "to": n["remarks"]}
         log.append("切过去还是不通，试下一个。")
     check_many([r["id"]])
     log.append("自动修复没成功，请到后台手动看看。")
@@ -1016,6 +1065,15 @@ def api_router_save(b):
             CFG["routers"].append(r)
         save_cfg(CFG)
     return {"id": r["id"]}
+
+
+def api_auto(b):
+    with LOCK:
+        targets = CFG["routers"] if b.get("all") else [get_router(b["id"])]
+        for r in targets:
+            r["auto_switch"] = bool(b.get("on"))
+        save_cfg(CFG)
+    return {"count": len(targets)}
 
 
 def api_router_delete(b):
@@ -1103,7 +1161,7 @@ def api_test_notify(_):
 POST_ROUTES = {
     "/api/check": api_check, "/api/nodes": api_nodes, "/api/test_node": api_test_node,
     "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart, "/api/pw_set": api_pw_set, "/api/del_node": api_del_node, "/api/wifi": api_wifi, "/api/wifi/save": api_wifi_save,
-    "/api/router/save": api_router_save, "/api/router/delete": api_router_delete,
+    "/api/router/save": api_router_save, "/api/router/delete": api_router_delete, "/api/router/auto": api_auto,
     "/api/frps/scan": api_frps_scan, "/api/router/bulk_add": api_bulk_add,
     "/api/settings/save": api_settings_save, "/api/settings/test_notify": api_test_notify,
 }
@@ -1248,7 +1306,9 @@ function render(){
  $("list").innerHTML=`<table><thead><tr><th>状态</th><th>盒子</th><th>WiFi</th><th class="hide-m">端口</th><th class="hide-m">frp</th><th>当前节点</th><th>外网</th><th class="hide-m">国内</th><th class="hide-m">检测</th><th>操作</th></tr></thead><tbody>`+
  rs.map(r=>{const s=r.status||{},l=lvl(r),[lt,lc]=LV[l];
   return `<tr><td><span class="dot bg-${lc}"></span><b class="${lc}">${lt}</b></td>
-  <td><b>${esc(r.name)}</b>${r.note?` <span class="muted small">${esc(r.note)}</span>`:""}${s.msg?`<div class="small ${lc}">${esc(s.msg)}</div>`:""}</td>
+  <td><b>${esc(r.name)}</b>${r.auto_switch?' <span class="tag" title="已开启自动切换节点">自动</span>':""}${r.note?` <span class="muted small">${esc(r.note)}</span>`:""}
+  ${r.auto_running?'<div class="small warn">⟳ 正在自动切换节点…</div>':(s.msg?`<div class="small ${lc}">${esc(s.msg)}</div>`:"")}
+  ${r.auto_log&&Date.now()/1000-r.auto_log.time<86400?`<div class="small ${r.auto_log.fixed?"ok":"bad"}">⟳ ${ago(r.auto_log.time)}：${esc(r.auto_log.text)}</div>`:""}</td>
   <td>${wifiCell(s.wifi)}</td><td class="hide-m">${esc(r.port)}</td><td class="hide-m nw">${s.frp===true?'<span class="ok">在线</span>':s.frp===false?'<span class="bad">离线</span>':'<span class="off">—</span>'}</td>
   <td>${esc(s.node_name||"—")}${s.node_count?` <span class="muted small">共${s.node_count}个</span>`:""}</td>
   <td>${net(s.google)}</td><td class="hide-m">${net(s.baidu)}</td><td class="hide-m muted small nw">${ago(s.time)}</td>
@@ -1275,6 +1335,8 @@ function renderNodes(){if(!NODES)return;const d=NODES;
  <div class="pwrow"><b>${d.has_udp?"TCP 节点":"节点"}</b><select id="selTcp">${nodeOpts(d,d.current,d.current?[]:[["","（未选择）"]])}</select>
   ${d.has_udp?`<b style="margin-left:8px">UDP 节点</b><select id="selUdp">${nodeOpts(d,d.udp||"nil",[["nil","关闭"],["tcp","与 TCP 节点相同"]])}</select>`:""}
   <button class="sm pri" onclick="saveNodesSel(this)">保存</button></div>
+ <div class="pwrow"><b>自动切换</b><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="autoSw" ${(R(d.id)||{}).auto_switch?"checked":""} onchange="setAuto(this)">
+  当前节点出问题时，自动切到列表里能用的最快节点</label></div>
  <div class="pwrow"><b>代理模式</b><span class="muted small">当前：${esc(curMode)}</span>
   ${MODES.map(([k,t])=>`<button class="sm ${d.mode===k?"pri":""}" ${k==="global"?`title="${GTIP}"`:""} onclick="pwSet({mode:'${k}'},'切换到「${t}」模式？'+('${k}'==='global'?'\\n（${GTIP}）':''),this)">${t}</button>`).join("")}</div>
  </div>
@@ -1306,6 +1368,11 @@ async function addLink(btn){const link=$("link").value.trim();if(!link)return to
  try{const r=await api("/api/add_link",{id,link,switch:$("sw").checked});const g=r.status&&r.status.google;
   toast("已添加："+r.added.map(x=>x.remarks).join("、")+(r.status?(g&&g.ok?`，已切换，外网正常 ${g.ms}ms`:"，已切换，但外网还是不通"):""),6000);await load();openNodes(id)}
  catch(e){toast(e.message,6000);btn.disabled=false;btn.textContent="添加节点"}}
+async function setAuto(cb){const id=NODES.id,on=cb.checked;
+ try{await api("/api/router/auto",{id,on});toast(on?"已开启自动切换：检测到节点异常会自动换到最快的可用节点":"已关闭自动切换",4000);await load()}
+ catch(e){cb.checked=!on;toast(e.message)}}
+async function autoAll(on){if(!await ask(on?"给全部盒子开启「自动切换节点」？":"关闭全部盒子的「自动切换节点」？"))return;
+ try{const r=await api("/api/router/auto",{all:true,on});toast(`已${on?"开启":"关闭"} ${r.count} 台`);await load()}catch(e){toast(e.message)}}
 async function pwSet(body,q,btn){if(q&&!await ask(q+"\n\nPassWall 会重启，客户会断网十几秒。"))return;const id=NODES.id;
  const t=btn?btn.textContent:"";if(btn){btn.disabled=true;btn.textContent="处理中…"}
  try{const r=await api("/api/pw_set",{id,...body});const st=r.status||{};
@@ -1385,6 +1452,7 @@ async function openSettings(){const s=await api("/api/settings");const ph=x=>x?"
  <label>默认用户名</label><input id="s_du" value="${esc(s.default_luci_user)}"><label>默认密码</label><input id="s_dp" type="password" placeholder="${ph(s.default_luci_password_set)}">
  <div class="sec">检测</div><label>自动检测间隔（分钟）</label><input id="s_iv" value="${esc(s.check_interval_min)}" placeholder="0 = 关闭">
  <label>外网测试地址</label><input id="s_tu" value="${esc(s.test_url)}">
+ <div class="sec">自动切换节点</div><label>全部盒子</label><div style="display:flex;gap:8px"><button type="button" onclick="autoAll(true)">全部开启</button><button type="button" onclick="autoAll(false)">全部关闭</button></div>
  <div class="sec">掉线通知（可选）</div><label>企业微信/钉钉机器人 Webhook</label><input id="s_wh" value="${esc(s.notify_webhook)}">
  <label>Telegram Bot Token</label><input id="s_tt" value="${esc(s.telegram.bot_token)}"><label>Telegram Chat ID</label><input id="s_tc" value="${esc(s.telegram.chat_id)}">
  <div class="sec">面板登录</div><label>面板用户名</label><input id="s_pu" value="${esc(s.panel_user)}"><label>新面板密码</label><input id="s_pp" type="password" placeholder="留空不改">
