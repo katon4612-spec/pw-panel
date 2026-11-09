@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 pw_panel_config.json
+pw_panel_history.jsonl

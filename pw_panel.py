@@ -85,6 +85,90 @@ def load_cfg():
 
 CFG = load_cfg()
 
+# ---------------------------------------------------------------- 历史记录
+HIST_PATH = os.path.join(BASE, "pw_panel_history.jsonl")
+HIST_LOCK = threading.Lock()
+HIST_MAX = 8000
+_hist_n = [0]
+
+
+def _hist_trim():
+    try:
+        with open(HIST_PATH, encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) > HIST_MAX:
+            with open(HIST_PATH + ".tmp", "w", encoding="utf-8") as f:
+                f.writelines(lines[-int(HIST_MAX * 0.8):])
+            os.replace(HIST_PATH + ".tmp", HIST_PATH)
+    except FileNotFoundError:
+        pass
+
+
+def hist(r, kind, text, ok=None):
+    """kind: status / auto / switch / add / del / wifi / set / restart / reboot / fix"""
+    rec = {"t": round(time.time()), "rid": r["id"] if r else "", "name": r["name"] if r else "",
+           "kind": kind, "text": text, "ok": ok}
+    with HIST_LOCK:
+        with open(HIST_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _hist_n[0] += 1
+        if _hist_n[0] % 500 == 0:
+            _hist_trim()
+
+
+def hist_read(rid=None, limit=300):
+    try:
+        with open(HIST_PATH, encoding="utf-8") as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            x = json.loads(line)
+        except ValueError:
+            continue
+        if rid and x.get("rid") != rid:
+            continue
+        out.append(x)
+        if len(out) >= limit:
+            break
+    return out
+
+
+# ---------------------------------------------------------------- 到期日识别
+DATE_FULL = re.compile(r"(20\d{2})[.\-/年](\d{1,2})[.\-/月](\d{1,2})")
+DATE_MD_EXP = re.compile(r"(?<![\d.])(\d{1,2})[.\-/月](\d{1,2})日?(?:号)?到期")
+
+
+def _mkdate(y, m, d):
+    import datetime
+    try:
+        return datetime.date(int(y), int(m), int(d))
+    except ValueError:
+        return None
+
+
+def detect_expire(text):
+    """从节点名 / 备注里找到期日，返回 'YYYY-MM-DD' 或 None"""
+    import datetime
+    if not text:
+        return None
+    m = DATE_FULL.search(text)
+    if m:
+        d = _mkdate(*m.groups())
+        if d:
+            return d.isoformat()
+    m = DATE_MD_EXP.search(text)
+    if m:
+        today = datetime.date.today()
+        d = _mkdate(today.year, m.group(1), m.group(2))
+        if d:
+            if d < today - datetime.timedelta(days=60):
+                d = _mkdate(today.year + 1, m.group(1), m.group(2)) or d
+            return d.isoformat()
+    return None
+
 
 def get_router(rid):
     for r in CFG["routers"]:
@@ -532,6 +616,12 @@ class Router:
                 return None
         return False
 
+    def reboot(self):
+        try:
+            self.ubus("system", "reboot", {}, timeout=15)
+        except Err:
+            self.ubus("file", "exec", {"command": "/sbin/reboot", "params": []}, timeout=15)
+
     def restart(self):
         app = self.app or (self.cfg or self.load_config())["app"]
         try:
@@ -709,6 +799,11 @@ def check_router(r):
         s.update(app=cfg["app"], enabled=cfg["enabled"], node_id=cfg["current"], node_count=len(cfg["nodes"]))
         cur = next((n for n in cfg["nodes"] if n["id"] == cfg["current"]), None)
         s["node_name"] = cur["remarks"] if cur else (cfg["current"] or "未选择")
+        for src in ([cur["remarks"]] if cur else []) + [r.get("note", "")] + [n["remarks"] for n in cfg["nodes"]]:
+            d = detect_expire(src)
+            if d:
+                s["expire_auto"] = {"date": d, "src": src}
+                break
         s["google"] = c.connect_test(CFG.get("test_url") or DEFAULT_CONFIG["test_url"], "google")
         s["baidu"] = c.connect_test(DOMESTIC_URL, "baidu")
         g, b = s["google"]["ok"], s["baidu"]["ok"]
@@ -752,7 +847,7 @@ def notify(text):
     threading.Thread(target=run, daemon=True).start()
 
 
-LEVEL_TEXT = {"ok": "正常", "node_bad": "节点异常", "dns_bad": "DNS坏了", "no_wan": "盒子没网", "disabled": "PassWall 未开",
+LEVEL_TEXT = {"ok": "正常", None: "未检测", "node_bad": "节点异常", "dns_bad": "DNS坏了", "no_wan": "盒子没网", "disabled": "PassWall 未开",
               "offline": "离线", "error": "出错"}
 
 
@@ -773,10 +868,15 @@ def check_many(ids=None):
         old = STATUS.get(r["id"]) or {}
         if s.get("wifi") is None and old.get("wifi"):
             s["wifi"] = old["wifi"]  # 离线时保留上次读到的 WiFi 名，方便认盒子
+        if not s.get("expire_auto") and old.get("expire_auto"):
+            s["expire_auto"] = old["expire_auto"]
         prev = old.get("level")
         STATUS[r["id"]] = s
         maybe_auto_switch(r, s)
         if prev and prev != s["level"]:
+            hist(r, "status", f"{LEVEL_TEXT.get(prev, prev)} → {LEVEL_TEXT.get(s['level'], s['level'])}"
+                 + (f"：{s['msg']}" if s.get("msg") else (f"（节点 {s.get('node_name')}）" if s["level"] == "ok" else "")),
+                 ok=s["level"] == "ok")
             if s["level"] != "ok" and prev == "ok":
                 alerts.append(f"❌ {r['name']}：{LEVEL_TEXT.get(s['level'])}。{s['msg']}")
             elif s["level"] == "ok":
@@ -815,18 +915,59 @@ def maybe_auto_switch(r, s):
             else:
                 text = "自动切换失败：" + last
             AUTO_LOG[rid] = {"time": time.time(), "fixed": res["fixed"], "text": text}
+            hist(r, "auto", text, ok=res["fixed"])
             if res.get("to") or not res["fixed"]:
                 notify(f"PassWall 面板 · 自动切换\n{'✅' if res['fixed'] else '❌'} {r['name']}：{text}")
         except Exception as e:
             AUTO_LOG[rid] = {"time": time.time(), "fixed": False, "text": f"自动切换出错：{e}"}
+            hist(r, "auto", f"自动切换出错：{e}", ok=False)
         finally:
             AUTO_RUNNING.discard(rid)
     threading.Thread(target=run, daemon=True).start()
 
 
+def expire_days(r):
+    import datetime
+    d = r.get("expire") or ((STATUS.get(r["id"]) or {}).get("expire_auto") or {}).get("date")
+    if not d:
+        return None, None
+    try:
+        return d, (datetime.date.fromisoformat(d) - datetime.date.today()).days
+    except ValueError:
+        return None, None
+
+
+def expiry_notify_daily():
+    import datetime
+    today = datetime.date.today().isoformat()
+    if CFG.get("last_expiry_notify") == today or datetime.datetime.now().hour < 9:
+        return
+    lines = []
+    for r in CFG["routers"]:
+        d, left = expire_days(r)
+        if left is not None and left <= 7:
+            lines.append(f"· {r['name']}：{d}（" + (f"已过期 {-left} 天" if left < 0 else ("今天到期" if left == 0 else f"还剩 {left} 天")) + "）")
+    with LOCK:
+        CFG["last_expiry_notify"] = today
+        save_cfg(CFG)
+    if lines:
+        notify("PassWall 面板 · 到期提醒\n" + "\n".join(lines))
+
+
+def restore_auto_log():
+    for x in reversed(hist_read(None, 3000)):
+        if x.get("kind") == "auto":
+            AUTO_LOG[x["rid"]] = {"time": x["t"], "fixed": bool(x.get("ok")), "text": x["text"]}
+
+
 def bg_loop():
     time.sleep(3)
+    restore_auto_log()
     while True:
+        try:
+            expiry_notify_daily()
+        except Exception:
+            traceback.print_exc()
         iv = int(CFG.get("check_interval_min") or 0)
         if iv > 0 and not LAST_FULL["running"]:
             LAST_FULL["running"] = True
@@ -894,19 +1035,35 @@ def api_del_node(b):
             done.append(c.delete_node(nid))
         except Err as e:
             fail.append(str(e))
+    if done:
+        hist(get_router(b["id"]), "del", "删除节点：" + "、".join(done), ok=True)
     return {"deleted": done, "failed": fail}
 
 
 def api_pw_set(b):
     r = get_router(b["id"])
     c = client_for(b)
+    cfg = c.load_config()
+    names = {n["id"]: n["remarks"] for n in cfg["nodes"]}
     try:
         c.set_global(enabled=b.get("enabled"), tcp=b.get("tcp"), udp=b.get("udp"), mode=b.get("mode"))
     except NETERR:
         pass  # 重启 PassWall 时连接被断开是正常的
+    parts = []
+    if b.get("enabled") is not None:
+        parts.append("打开 PassWall" if b["enabled"] else "关闭 PassWall")
+    if b.get("tcp"):
+        parts.append(f"节点改为「{names.get(b['tcp'], b['tcp'])}」")
+    if b.get("udp"):
+        parts.append(f"UDP 节点改为「{ {'nil': '关闭', 'tcp': '与TCP相同'}.get(b['udp']) or names.get(b['udp'], b['udp'])}」")
+    if b.get("mode"):
+        parts.append("模式改为「" + {"gfw": "GFW 列表", "chnroute": "中国列表以外", "returnhome": "中国列表",
+                                    "global": "全局代理"}.get(b["mode"], b["mode"]) + "」")
     time.sleep(3)
     check_many([r["id"]])
-    return {"status": STATUS.get(r["id"])}
+    st = STATUS.get(r["id"]) or {}
+    hist(r, "set", "、".join(parts) + f" → {LEVEL_TEXT.get(st.get('level'), '')}", ok=st.get("level") == "ok")
+    return {"status": st}
 
 
 def api_test_node(b):
@@ -922,12 +1079,16 @@ def api_switch(b):
     r = get_router(b["id"])
     c = client_for(b)
     try:
+        name = c.node(b["node"])["remarks"]
         c.switch(b["node"])
     except NETERR:
+        hist(r, "switch", "切换节点时连接超时", ok=False)
         raise Err("切换时连接超时，PassWall 可能还在重启，稍后点「检测」确认")
     time.sleep(2)
     check_many([r["id"]])
-    return {"status": STATUS.get(r["id"])}
+    st = STATUS.get(r["id"]) or {}
+    hist(r, "switch", f"手动切换到「{name}」 → {LEVEL_TEXT.get(st.get('level'), '')}", ok=st.get("level") == "ok")
+    return {"status": st}
 
 
 def api_add_link(b):
@@ -935,16 +1096,22 @@ def api_add_link(b):
     c = client_for(b)
     new = c.add_link(b.get("link", ""))
     res = {"added": new}
+    text = "添加节点：" + "、".join(n["remarks"] for n in new)
     if b.get("switch"):
         c.switch(new[0]["id"])
         time.sleep(2)
         check_many([r["id"]])
         res["status"] = STATUS.get(r["id"])
+        text += f"，并切换到「{new[0]['remarks']}」 → {LEVEL_TEXT.get(res['status'].get('level'), '')}"
+    hist(r, "add", text, ok=True)
     return res
 
 
 def api_autofix(b):
-    return autofix_core(get_router(b["id"]))
+    r = get_router(b["id"])
+    res = autofix_core(r)
+    hist(r, "fix", "一键修复：" + (res["log"][-1] if res["log"] else ""), ok=res["fixed"])
+    return res
 
 
 def autofix_core(r, wait_first=0):
@@ -1021,7 +1188,26 @@ def api_restart(b):
         pass  # 重启时连接被断开是正常的
     time.sleep(5)
     check_many([r["id"]])
-    return {"status": STATUS.get(r["id"])}
+    st = STATUS.get(r["id"]) or {}
+    hist(r, "restart", f"重启 PassWall → {LEVEL_TEXT.get(st.get('level'), '')}", ok=st.get("level") == "ok")
+    return {"status": st}
+
+
+def api_reboot(b):
+    r = get_router(b["id"])
+    c = client_for(b)
+    try:
+        c.reboot()
+    except NETERR:
+        pass
+    hist(r, "reboot", "重启盒子（约 1~3 分钟后恢复）", ok=None)
+    st = STATUS.setdefault(r["id"], {"level": "offline", "time": time.time()})
+    st["msg"] = "盒子正在重启，1~3 分钟后点「检测」"
+    return {}
+
+
+def api_history(b):
+    return {"items": hist_read(b.get("id"), int(b.get("limit") or 300))}
 
 
 def api_wifi(b):
@@ -1036,12 +1222,70 @@ def api_wifi_save(b):
         n = c.wifi_save(b.get("changes") or [])
     except NETERR:
         n = -1  # 重载无线时连接被断开，通常已经生效
+    descs = []
+    for ch in b.get("changes") or []:
+        descs.append(f"{ch.get('ssid', '')}" + ("（关闭）" if ch.get("disabled") else ""))
+    hist(r, "wifi", "修改 WiFi：" + "、".join(descs) + "（名称/密码/开关）", ok=True)
     try:
         if r["id"] in STATUS:
             STATUS[r["id"]]["wifi"] = Router(r).login().wifi()
     except Exception:
         pass
     return {"changed": n}
+
+
+BATCH_ACTIONS = {
+    "check": None, "add_link": "api_add_link", "mode": "api_pw_set", "enable": "api_pw_set",
+    "restart": "api_restart", "reboot": "api_reboot", "auto": None,
+}
+
+
+def api_batch(b):
+    ids = [i for i in (b.get("ids") or []) if any(r["id"] == i for r in CFG["routers"])]
+    act = b.get("action")
+    if not ids:
+        raise Err("没有选中盒子")
+    if act not in BATCH_ACTIONS:
+        raise Err("未知操作")
+    if act == "check":
+        check_many(ids)
+        return {"results": [{"id": i, "name": get_router(i)["name"], "ok": (STATUS.get(i) or {}).get("level") == "ok",
+                             "text": LEVEL_TEXT.get((STATUS.get(i) or {}).get("level"), "")} for i in ids]}
+    if act == "auto":
+        with LOCK:
+            for i in ids:
+                get_router(i)["auto_switch"] = bool(b.get("on"))
+            save_cfg(CFG)
+        return {"results": [{"id": i, "name": get_router(i)["name"], "ok": True,
+                             "text": "已开启自动切换" if b.get("on") else "已关闭自动切换"} for i in ids]}
+    fn = globals()[BATCH_ACTIONS[act]]
+
+    def one(i):
+        r = get_router(i)
+        body = {"id": i}
+        if act == "add_link":
+            body.update(link=b.get("link", ""), switch=bool(b.get("switch")))
+        elif act == "mode":
+            body["mode"] = b.get("mode")
+        elif act == "enable":
+            body["enabled"] = bool(b.get("on"))
+        try:
+            res = fn(body) or {}
+            st = res.get("status") or {}
+            if act == "add_link":
+                text = "已添加：" + "、".join(n["remarks"] for n in res.get("added", []))
+                if st:
+                    text += f"，已切换 → {LEVEL_TEXT.get(st.get('level'), '')}"
+            elif act == "reboot":
+                text = "已发送重启命令"
+            else:
+                text = "完成 → " + LEVEL_TEXT.get(st.get("level"), "")
+            ok = (st.get("level") == "ok") if st else True
+            return {"id": i, "name": r["name"], "ok": ok, "text": text}
+        except (Err, *NETERR) as e:
+            return {"id": i, "name": r["name"], "ok": False, "text": str(e)}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return {"results": list(ex.map(one, ids))}
 
 
 def api_router_save(b):
@@ -1051,7 +1295,7 @@ def api_router_save(b):
     fields = {"name": (b.get("name") or "").strip() or f"盒子-{port}", "port": int(port),
               "host": (b.get("host") or "").strip(), "user": (b.get("user") or "").strip(),
               "note": (b.get("note") or "").strip(), "frp_name": (b.get("frp_name") or "").strip(),
-              "https": bool(b.get("https"))}
+              "https": bool(b.get("https")), "expire": (b.get("expire") or "").strip()}
     with LOCK:
         if b.get("id"):
             r = get_router(b["id"])
@@ -1161,7 +1405,8 @@ def api_test_notify(_):
 POST_ROUTES = {
     "/api/check": api_check, "/api/nodes": api_nodes, "/api/test_node": api_test_node,
     "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart, "/api/pw_set": api_pw_set, "/api/del_node": api_del_node, "/api/wifi": api_wifi, "/api/wifi/save": api_wifi_save,
-    "/api/router/save": api_router_save, "/api/router/delete": api_router_delete, "/api/router/auto": api_auto,
+    "/api/router/save": api_router_save, "/api/router/delete": api_router_delete, "/api/batch": api_batch, "/api/reboot": api_reboot,
+    "/api/history": api_history, "/api/router/auto": api_auto,
     "/api/frps/scan": api_frps_scan, "/api/router/bulk_add": api_bulk_add,
     "/api/settings/save": api_settings_save, "/api/settings/test_notify": api_test_notify,
 }
@@ -1286,7 +1531,7 @@ tr:last-child td{border-bottom:0}th,td:first-child,.nw{white-space:nowrap}
 .ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.off{color:var(--off)}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%}
 .bg-ok{background:var(--ok)}.bg-bad{background:var(--bad)}.bg-warn{background:var(--warn)}.bg-off{background:var(--faint)}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px 3px 8px;border-radius:99px;font-size:12.5px;font-weight:600}
+.pill{display:inline-flex;align-items:center;gap:6px;white-space:nowrap;padding:3px 10px 3px 8px;border-radius:99px;font-size:12.5px;font-weight:600}
 .pill i{width:6px;height:6px;border-radius:50%;background:currentColor}
 .p-ok{background:var(--ok-t);color:var(--ok)}.p-bad{background:var(--bad-t);color:var(--bad)}.p-warn{background:var(--warn-t);color:var(--warn)}.p-off{background:var(--off-t);color:var(--off)}
 .ops{display:flex;gap:5px;flex-wrap:wrap}
@@ -1314,17 +1559,62 @@ td b{font-weight:600}
 .pwset{border:1px solid var(--line);border-radius:12px;padding:4px 14px;background:var(--soft)}
 .pwrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line)}.pwrow:last-child{border-bottom:0}
 .pwrow>b{min-width:74px;font-weight:600}.pwrow select{max-width:270px}
-@media(max-width:760px){header{padding:12px 14px}main{padding:14px}.hide-m{display:none}th,td{padding:8px 7px}.form{grid-template-columns:1fr}#q{width:100%}}
+.pill.xs{font-size:11px;padding:1px 8px;font-weight:600;vertical-align:1px}
+th.ck,td.ck{width:34px;padding-right:0}
+tr.sel{background:#FBF5F1 !important}
+#batch{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:8;width:min(1100px,calc(100% - 24px));animation:pop .18s}
+#batch[hidden]{display:none}
+#batch .bin{display:flex;gap:6px;flex-wrap:wrap;align-items:center;background:#262624;color:#FAF9F5;border-radius:14px;padding:10px 12px;box-shadow:0 10px 30px rgba(0,0,0,.25)}
+#batch .bin b{margin-right:6px;color:#F3C3B0}
+#batch button{background:#3A3936;border-color:#4A4945;color:#FAF9F5}#batch button:hover{background:#4A4945}
+#batch button.danger{color:#F2A49B;border-color:#6B3F3A}
+main{padding-bottom:110px}
+.tl{display:flex;flex-direction:column;gap:2px;max-height:65vh;overflow:auto}
+.tli{display:flex;gap:12px;padding:10px 4px;border-bottom:1px solid var(--line)}.tli:last-child{border-bottom:0}
+.tld{flex:none;width:9px;height:9px;border-radius:50%;margin-top:6px}
+@media(max-width:760px){
+ .hide-m{display:none}
+ header{padding:10px 12px;gap:10px}.brand{width:100%}.actions{margin-left:0;width:100%}.actions button{flex:1;padding:9px 8px}#q{width:100%;order:-1}
+ h1{font-size:19px}.sum{width:100%;overflow-x:auto;flex-wrap:nowrap;padding-bottom:2px}.chip{flex:none}
+ main{padding:12px 10px 120px}.form{grid-template-columns:1fr}
+ table.main,table.main tbody{display:block;border:0;background:none;box-shadow:none}
+ table.main thead{display:none}
+ table.main tr{display:grid;grid-template-columns:auto 1fr;gap:4px 10px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin-bottom:10px;box-shadow:var(--sh)}
+ table.main td{display:block;border:0;padding:0}
+ table.main td.ck{grid-row:1;grid-column:1;align-self:start;padding-top:3px}
+ table.main td.c-st{grid-row:1;grid-column:2;justify-self:end}
+ table.main td.c-name{grid-column:1/-1;font-size:15px}
+ table.main td[data-l]{grid-column:1/-1;display:flex;gap:10px;font-size:13.5px}
+ table.main td[data-l]:before{content:attr(data-l);color:var(--muted);min-width:44px;flex:none}
+ table.main td.hide-m{display:none}
+ table.main td.c-ops{grid-column:1/-1;margin-top:8px;padding-top:10px;border-top:1px solid var(--line)}
+ .ops{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}.ops a{display:block}.ops button.sm{width:100%;padding:8px 4px;font-size:13.5px}
+ .wf{max-width:none}.wfl{min-width:0}
+ .box{border-radius:16px}.modal{padding:10px 6px}.mb{padding:14px}
+ .pwrow select{max-width:100%;flex:1 1 100%}
+ #batch{bottom:8px}#batch .bin{gap:5px}#batch button.sm{flex:1 1 auto;padding:7px 8px}
+}
 </style></head><body>
 <header><div class="brand"><div class="logo">✳</div><h1>PassWall 节点面板</h1></div><div class="sum" id="sum"></div>
 <div class="actions"><input id="q" placeholder="搜索名称 / WiFi / 备注 / 端口" oninput="render()" style="width:180px">
 <button class="pri" id="btnAll" onclick="checkAll()">全部检测</button><button onclick="openImport()">从 frps 导入</button>
-<button onclick="editRouter()">添加盒子</button><button onclick="openSettings()">设置</button></div></header>
+<button onclick="editRouter()">添加盒子</button><button onclick="openHist()">记录</button><button onclick="openSettings()">设置</button></div></header>
 <main><div class="muted small" id="meta" style="margin-bottom:8px"></div><div id="list"></div></main>
 <div id="modal" class="modal" hidden onclick="if(event.target===this)closeM()"><div class="box"><div class="mh"><b id="mt"></b><button onclick="closeM()">×</button></div><div class="mb" id="mb"></div></div></div>
 <div id="ask" class="modal" hidden style="z-index:15;align-items:center"><div class="box" style="width:min(460px,100%)"><div class="mb">
 <div id="askT" style="white-space:pre-wrap;line-height:1.7"></div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
-<button id="askN">取消</button><button class="pri" id="askY">确定</button></div></div></div></div><div id="toast"></div>
+<button id="askN">取消</button><button class="pri" id="askY">确定</button></div></div></div></div><div id="batch" hidden><div class="bin"><b id="bcount"></b>
+<button class="sm" onclick="batchRun('check')">检测</button>
+<button class="sm" onclick="batchAdd()">添加节点</button>
+<button class="sm" onclick="batchMode()">代理模式</button>
+<button class="sm" onclick="batchRun('enable',{on:true},'打开 PassWall？')">打开PassWall</button>
+<button class="sm" onclick="batchRun('enable',{on:false},'关闭 PassWall？关闭后客户将无法访问外网。')">关闭PassWall</button>
+<button class="sm" onclick="batchRun('auto',{on:true},'开启自动切换节点？')">开自动切换</button>
+<button class="sm" onclick="batchRun('auto',{on:false},'关闭自动切换节点？')">关自动切换</button>
+<button class="sm" onclick="batchRun('restart',null,'重启 PassWall？客户会断网十几秒。')">重启PassWall</button>
+<button class="sm danger" onclick="batchRun('reboot',null,'重启整台盒子？客户会断网 1~3 分钟。')">重启盒子</button>
+<button class="sm" style="margin-left:auto" onclick="SEL.clear();render()">取消选择</button></div></div>
+<div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -1342,33 +1632,74 @@ function ago(ts){if(!ts)return"—";const s=Math.round(Date.now()/1000-ts);retur
 function net(t){if(!t)return'<span class="off">—</span>';if(t.ok===null)return'<span class="off">未知</span>';return t.ok?`<span class="ok">${t.ms??"通"}${t.ms!=null?"ms":""}</span>`:'<span class="bad">不通</span>'}
 function wifiCell(w){if(w==null)return'<span class="off">—</span>';if(!w.length)return'<span class="off small">无 WiFi</span>';
  const g={};w.forEach(x=>{const k=x.ssid+"\u0000"+(x.disabled?1:0);(g[k]=g[k]||{ssid:x.ssid,dis:x.disabled,b:[]}).b.push(x.band)});
- return Object.values(g).sort((a,b)=>a.dis-b.dis).map(x=>{const b=[...new Set(x.b.filter(Boolean))].join("/");
-  return `<div class="wf ${x.dis?"off":""}" title="${esc(x.ssid)}">${esc(x.ssid)}${b?` <span class="muted small">${b}</span>`:""}${x.dis?' <span class="small">已关</span>':""}</div>`}).join("")}
+ return '<div class="wfl">'+Object.values(g).sort((a,b)=>a.dis-b.dis).map(x=>{const b=[...new Set(x.b.filter(Boolean))].join("/");
+  return `<div class="wf ${x.dis?"off":""}" title="${esc(x.ssid)}">${esc(x.ssid)}${b?` <span class="muted small">${b}</span>`:""}${x.dis?' <span class="small">已关</span>':""}</div>`}).join("")+"</div>"}
 function lvl(r){const l=r.status&&r.status.level;return LV[l]?l:"none"}
 async function load(){try{S=await api("/api/state");render()}catch(e){}}
+function expInfo(r){const s=r.status||{};const d=r.expire||(s.expire_auto&&s.expire_auto.date);if(!d)return null;
+ const left=Math.round((new Date(d+"T00:00:00")-new Date(new Date().toDateString()))/86400000);
+ return {d,left,auto:!r.expire,src:s.expire_auto&&s.expire_auto.src}}
+function expBadge(r){const e=expInfo(r);if(!e)return"";const c=e.left<0?"p-bad":e.left<=7?"p-warn":"p-off";
+ const t=e.left<0?`已过期 ${-e.left} 天`:e.left===0?"今天到期":`剩 ${e.left} 天`;
+ return ` <span class="pill ${c} xs" title="到期日 ${e.d}${e.auto?"（从「"+esc(e.src||"")+"」自动识别）":""}">${e.left<=7?"⏰ ":""}${e.d.slice(2).replace(/-/g,".")} · ${t}</span>`}
+const SEL=new Set();
 function render(){
  const q=$("q").value.trim().toLowerCase();const cnt={};S.routers.forEach(r=>{const l=lvl(r);cnt[l]=(cnt[l]||0)+1});
+ const nexp=S.routers.filter(r=>{const e=expInfo(r);return e&&e.left<=7}).length;
  $("sum").innerHTML=`<span class="chip ${FILTER===null?"on":""}" onclick="FILTER=null;render()">全部 <b>${S.routers.length}</b></span>`+
-  Object.keys(ORD).filter(k=>cnt[k]).map(k=>`<span class="chip ${FILTER===k?"on":""}" onclick="FILTER='${k}';render()"><span class="dot bg-${LV[k][1]}"></span>${LV[k][0]} <b>${cnt[k]}</b></span>`).join("");
+  Object.keys(ORD).filter(k=>cnt[k]).map(k=>`<span class="chip ${FILTER===k?"on":""}" onclick="FILTER='${k}';render()"><span class="dot bg-${LV[k][1]}"></span>${LV[k][0]} <b>${cnt[k]}</b></span>`).join("")+
+  (nexp?`<span class="chip ${FILTER==="exp"?"on":""}" onclick="FILTER='exp';render()">⏰ 即将到期 <b>${nexp}</b></span>`:"");
  $("meta").textContent=(S.checking?"正在全部检测… ":"")+"上次全部检测："+ago(S.last_full)+(S.interval>0?`，每 ${S.interval} 分钟自动检测`:"，自动检测已关闭");
  $("btnAll").disabled=!!S.checking;$("btnAll").textContent=S.checking?"检测中…":"全部检测";
- let rs=S.routers.filter(r=>(!q||[r.name,r.note,r.port,r.frp_name,...((r.status&&r.status.wifi)||[]).map(w=>w.ssid)].join(" ").toLowerCase().includes(q))&&(FILTER===null||lvl(r)===FILTER));
- rs.sort((a,b)=>(ORD[lvl(a)]-ORD[lvl(b)])||String(a.name).localeCompare(String(b.name),"zh"));
- if(!S.routers.length){$("list").innerHTML='<div class="empty">还没有盒子。先点「设置」填 frps 面板账号和后台默认密码，再点「从 frps 导入」。</div>';return}
- $("list").innerHTML=`<table><thead><tr><th>状态</th><th>盒子</th><th>WiFi</th><th class="hide-m">端口</th><th class="hide-m">frp</th><th>当前节点</th><th>外网</th><th class="hide-m">国内</th><th class="hide-m">检测</th><th>操作</th></tr></thead><tbody>`+
+ let rs=S.routers.filter(r=>(!q||[r.name,r.note,r.port,r.frp_name,...((r.status&&r.status.wifi)||[]).map(w=>w.ssid)].join(" ").toLowerCase().includes(q))
+   &&(FILTER===null||(FILTER==="exp"?((expInfo(r)||{left:99}).left<=7):lvl(r)===FILTER)));
+ if(FILTER==="exp")rs.sort((a,b)=>expInfo(a).left-expInfo(b).left);
+ else rs.sort((a,b)=>(ORD[lvl(a)]-ORD[lvl(b)])||String(a.name).localeCompare(String(b.name),"zh"));
+ VISIBLE=rs.map(r=>r.id);
+ [...SEL].forEach(id=>{if(!S.routers.some(r=>r.id===id))SEL.delete(id)});
+ if(!S.routers.length){$("list").innerHTML='<div class="empty">还没有盒子。先点「设置」填 frps 面板账号和后台默认密码，再点「从 frps 导入」。</div>';renderBatch();return}
+ const allOn=rs.length&&rs.every(r=>SEL.has(r.id));
+ $("list").innerHTML=`<table class="main"><thead><tr><th class="ck"><input type="checkbox" ${allOn?"checked":""} onclick="selAll(this.checked)" title="全选当前列表"></th><th>状态</th><th>盒子</th><th>WiFi</th><th class="hide-m">端口</th><th class="hide-m">frp</th><th>当前节点</th><th>外网</th><th class="hide-m">国内</th><th class="hide-m">检测</th><th>操作</th></tr></thead><tbody>`+
  rs.map(r=>{const s=r.status||{},l=lvl(r),[lt,lc]=LV[l];
-  return `<tr><td><span class="pill p-${lc}"><i></i>${lt}</span></td>
-  <td><b>${esc(r.name)}</b>${r.auto_switch?' <span class="tag" title="已开启自动切换节点">自动</span>':""}${r.note?` <span class="muted small">${esc(r.note)}</span>`:""}
+  return `<tr class="${SEL.has(r.id)?"sel":""}"><td class="ck"><input type="checkbox" ${SEL.has(r.id)?"checked":""} onclick="selOne('${r.id}',this.checked)"></td>
+  <td class="c-st"><span class="pill p-${lc}"><i></i>${lt}</span></td>
+  <td class="c-name"><b>${esc(r.name)}</b>${r.auto_switch?' <span class="tag" title="已开启自动切换节点">自动</span>':""}${expBadge(r)}${r.note?` <span class="muted small">${esc(r.note)}</span>`:""}
   ${r.auto_running?'<div class="small warn">⟳ 正在自动切换节点…</div>':(s.msg?`<div class="small ${lc}">${esc(s.msg)}</div>`:"")}
   ${r.auto_log&&Date.now()/1000-r.auto_log.time<86400?`<div class="small ${r.auto_log.fixed?"ok":"bad"}">⟳ ${ago(r.auto_log.time)}：${esc(r.auto_log.text)}</div>`:""}</td>
-  <td>${wifiCell(s.wifi)}</td><td class="hide-m">${esc(r.port)}</td><td class="hide-m nw">${s.frp===true?'<span class="ok">在线</span>':s.frp===false?'<span class="bad">离线</span>':'<span class="off">—</span>'}</td>
-  <td>${esc(s.node_name||"—")}${s.node_count?` <span class="muted small nw">共${s.node_count}个</span>`:""}</td>
-  <td>${net(s.google)}</td><td class="hide-m">${net(s.baidu)}</td><td class="hide-m muted small nw">${ago(s.time)}</td>
-  <td><div class="ops"><button class="sm" onclick="checkOne('${r.id}',this)">检测</button><button class="sm" onclick="openNodes('${r.id}')">节点</button><button class="sm" onclick="openWifi('${r.id}')">WiFi</button>
+  <td data-l="WiFi">${wifiCell(s.wifi)}</td><td class="hide-m" data-l="端口">${esc(r.port)}</td><td class="hide-m nw" data-l="frp">${s.frp===true?'<span class="ok">在线</span>':s.frp===false?'<span class="bad">离线</span>':'<span class="off">—</span>'}</td>
+  <td data-l="节点">${esc(s.node_name||"—")}${s.node_count?` <span class="muted small nw">共${s.node_count}个</span>`:""}</td>
+  <td data-l="外网">${net(s.google)}</td><td class="hide-m" data-l="国内">${net(s.baidu)}</td><td class="hide-m muted small nw" data-l="检测">${ago(s.time)}</td>
+  <td class="c-ops"><div class="ops"><button class="sm" onclick="checkOne('${r.id}',this)">检测</button><button class="sm" onclick="openNodes('${r.id}')">节点</button><button class="sm" onclick="openWifi('${r.id}')">WiFi</button>
   ${l==="node_bad"?`<button class="sm pri" onclick="autofix('${r.id}')">一键修复</button>`:""}
   ${l==="disabled"?`<button class="sm pri" onclick="quickEnable('${r.id}',this)">打开PassWall</button>`:""}
   ${l==="dns_bad"?`<button class="sm pri" onclick="restartPW('${r.id}',this)">重启PassWall</button>`:""}
-  <a href="${esc(r.luci_url)}" target="_blank"><button class="sm">后台</button></a><button class="sm" onclick="editRouter('${r.id}')">编辑</button></div></td></tr>`}).join("")+"</tbody></table>"}
+  <a href="${esc(r.luci_url)}" target="_blank"><button class="sm">后台</button></a><button class="sm" onclick="openHist('${r.id}')">记录</button><button class="sm" onclick="editRouter('${r.id}')">编辑</button></div></td></tr>`}).join("")+"</tbody></table>";
+ renderBatch()}
+let VISIBLE=[];
+function selOne(id,on){on?SEL.add(id):SEL.delete(id);render()}
+function selAll(on){VISIBLE.forEach(id=>on?SEL.add(id):SEL.delete(id));render()}
+function renderBatch(){const b=$("batch");if(!SEL.size){b.hidden=true;return}b.hidden=false;
+ $("bcount").textContent=`已选 ${SEL.size} 台`}
+async function batchRun(action,extra,q){const ids=[...SEL];if(q&&!await ask(`对选中的 ${ids.length} 台盒子：${q}`))return;
+ openM(`批量操作 · ${ids.length} 台`,'<p class="muted">正在执行，每次同时处理 6 台，请稍候…</p>');
+ try{const r=await api("/api/batch",{ids,action,...(extra||{})});const ok=r.results.filter(x=>x.ok).length;
+  $("mb").innerHTML=`<p><b class="ok">成功 ${ok}</b> · <b class="${r.results.length-ok?"bad":"muted"}">未成功 ${r.results.length-ok}</b></p>
+  <table><thead><tr><th>盒子</th><th>结果</th></tr></thead><tbody>${r.results.sort((a,b)=>a.ok-b.ok).map(x=>`<tr><td class="nw"><b>${esc(x.name)}</b></td><td class="${x.ok?"ok":"bad"}">${x.ok?"✓":"✗"} ${esc(x.text)}</td></tr>`).join("")}</tbody></table>`;
+  load()}catch(e){$("mb").innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
+function batchAdd(){openM(`批量添加节点 · ${SEL.size} 台`,`<p class="muted small">粘贴节点（可多行，一行一个）：分享链接或 SOCKS5（地址:端口:用户名:密码 / socks://…），会加到每一台选中的盒子里。</p>
+ <textarea id="blink" rows="5" style="width:100%"></textarea><div style="display:flex;gap:10px;align-items:center;margin-top:10px">
+ <label><input type="checkbox" id="bsw"> 添加后立即切换过去（第一条）</label><button class="pri" style="margin-left:auto" onclick="const l=$('blink').value.trim();if(!l)return toast('先粘贴节点');batchRun('add_link',{link:l,switch:$('bsw').checked})">添加到 ${SEL.size} 台</button></div>`)}
+function batchMode(){openM(`批量切换代理模式 · ${SEL.size} 台`,`<p class="muted small">选中的盒子会切到同一个模式，PassWall 会重启，客户断网十几秒。</p>
+ <div style="display:flex;gap:8px;flex-wrap:wrap">${MODES.map(([k,t])=>`<button class="${k==="global"?"pri":""}" ${k==="global"?`title="${GTIP}"`:""} onclick="batchRun('mode',{mode:'${k}'},'切换到「${t}」模式？')">${t}</button>`).join("")}</div>`)}
+async function openHist(id){const title=id?R(id).name+" · 记录":"全部记录";openM(title,'<p class="muted">读取中…</p>');
+ try{const r=await api("/api/history",{id:id||"",limit:300});
+  if(!r.items.length){$("mb").innerHTML='<p class="muted">还没有记录。状态变化、自动切换和你在面板上的操作都会记在这里。</p>';return}
+  const K={status:"状态",auto:"自动切换",switch:"切换节点",add:"添加节点",del:"删除节点",wifi:"WiFi",set:"PassWall 设置",restart:"重启PassWall",reboot:"重启盒子",fix:"一键修复"};
+  $("mb").innerHTML=`<div class="tl">${r.items.map(x=>`<div class="tli"><span class="tld ${x.ok===true?"bg-ok":x.ok===false?"bg-bad":"bg-off"}"></span>
+   <div><div class="small muted">${new Date(x.t*1000).toLocaleString("zh-CN",{hour12:false})} · ${K[x.kind]||x.kind}${id?"":" · <b>"+esc(x.name)+"</b>"}</div><div>${esc(x.text)}</div></div></div>`).join("")}</div>`}
+ catch(e){$("mb").innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
+async function rebootBox(id,btn){if(!await ask(`重启「${R(id).name}」整台盒子？\n客户会断网 1~3 分钟，等它自己恢复。`))return;btn.disabled=true;btn.textContent="重启中…";
+ try{await api("/api/reboot",{id});toast("已发送重启命令，1~3 分钟后点「检测」",6000);await load()}catch(e){toast(e.message,6000)}finally{btn.disabled=false;btn.textContent="重启盒子"}}
 async function checkAll(){$("btnAll").disabled=true;$("btnAll").textContent="检测中…";try{S=await api("/api/check",{});render();toast("全部检测完成")}catch(e){toast(e.message);load()}}
 async function checkOne(id,btn){btn.disabled=true;btn.textContent="…";try{S=await api("/api/check",{id});render()}catch(e){toast(e.message)}finally{btn.disabled=false;btn.textContent="检测"}}
 const R=id=>S.routers.find(r=>r.id===id);
@@ -1383,7 +1714,7 @@ function renderNodes(){if(!NODES)return;const d=NODES;
  $("mb").innerHTML=`<div class="pwset">
  <div class="pwrow"><b>总开关</b><span>${d.enabled?'<span class="ok">● 已开启</span>':'<span class="bad">● 已关闭</span>'}</span>
   <button class="sm ${d.enabled?"danger":"pri"}" onclick="pwSet({enabled:${!d.enabled}},'${d.enabled?"关闭":"打开"} PassWall？'+(${d.enabled}?'关闭后客户将无法访问外网。':''),this)">${d.enabled?"关闭 PassWall":"打开 PassWall"}</button>
-  <span style="margin-left:auto"></span><button class="sm" onclick="restartPW(NODES.id,this)">重启PassWall</button></div>
+  <span style="margin-left:auto"></span><button class="sm" onclick="restartPW(NODES.id,this)">重启PassWall</button><button class="sm danger" onclick="rebootBox(NODES.id,this)">重启盒子</button></div>
  <div class="pwrow"><b>${d.has_udp?"TCP 节点":"节点"}</b><select id="selTcp">${nodeOpts(d,d.current,d.current?[]:[["","（未选择）"]])}</select>
   ${d.has_udp?`<b style="margin-left:8px">UDP 节点</b><select id="selUdp">${nodeOpts(d,d.udp||"nil",[["nil","关闭"],["tcp","与 TCP 节点相同"]])}</select>`:""}
   <button class="sm pri" onclick="saveNodesSel(this)">保存</button></div>
@@ -1478,11 +1809,13 @@ function editRouter(id){const r=id?R(id):{};
  <label>后台用户名</label><input id="f_user" value="${esc(r.user||"")}" placeholder="留空 = 默认（root）">
  <label>后台密码</label><input id="f_pw" type="password" placeholder="${r.has_password?"已单独设置，留空不改":"留空 = 用默认密码"}">
  ${r.has_password?'<label></label><label><input type="checkbox" id="f_clr"> 清除单独密码，改用默认密码</label>':""}
+ <label>服务到期日</label><div><input id="f_exp" type="date" value="${esc(r.expire||"")}">
+ <div class="muted small" style="margin-top:4px">留空 = 自动从节点名/备注里识别（如"2027.8.27"、"1.13到期"）${r.status&&r.status.expire_auto?`，当前识别到 <b>${esc(r.status.expire_auto.date)}</b>`:""}</div></div>
  <label>frp 代理名</label><input id="f_frp" value="${esc(r.frp_name||"")}" placeholder="用来对应 frp 在线状态（可选）">
  <label>HTTPS 后台</label><label><input type="checkbox" id="f_https" ${r.https?"checked":""}> 后台是 https</label>
  <div class="full" style="display:flex;gap:8px;margin-top:6px">${id?`<button class="danger" onclick="delRouter('${id}')">删除</button>`:""}
  <button class="pri" style="margin-left:auto" onclick="saveRouter('${id||""}')">保存</button></div></div>`)}
-async function saveRouter(id){const b={id:id||undefined,name:$("f_name").value,note:$("f_note").value,port:$("f_port").value,host:$("f_host").value,
+async function saveRouter(id){const b={id:id||undefined,expire:$("f_exp").value,name:$("f_name").value,note:$("f_note").value,port:$("f_port").value,host:$("f_host").value,
  user:$("f_user").value,password:$("f_pw").value,frp_name:$("f_frp").value,https:$("f_https").checked,clear_password:$("f_clr")?$("f_clr").checked:false};
  try{const r=await api("/api/router/save",b);closeM();await load();toast("已保存，正在检测…");S=await api("/api/check",{id:r.id});render()}catch(e){toast(e.message)}}
 async function delRouter(id){if(!await ask("确定删除这个盒子？（只是从面板移除，不影响路由器）"))return;try{await api("/api/router/delete",{id});closeM();load()}catch(e){toast(e.message)}}

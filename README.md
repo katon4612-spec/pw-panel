@@ -8,6 +8,9 @@
 - 一键修复：自动挑能用的最快备用节点切过去
 - 从 frps 一键导入盒子
 - 掉线通知：企业微信 / 钉钉机器人 / Telegram
+- 批量操作：勾选多台一起加节点、切模式、开关 PassWall、自动切换、重启
+- 到期提醒：手动填或从节点名自动识别，提前 7 天提醒
+- 自动切换节点、历史记录、重启盒子、手机版排版
 
 ## 一键安装 / 更新
 
@@ -40,4 +43,4 @@ bash <(curl -fsSL https://raw.githubusercontent.com/katon4612-spec/pw-panel/main
 | 查看面板密码 | `cat /opt/pw-panel/pw_panel_config.json` |
 | 卸载 | `systemctl disable --now pw-panel && rm -rf /opt/pw-panel /etc/systemd/system/pw-panel.service` |
 
-配置（包括各盒子的后台密码）只保存在服务器的 `/opt/pw-panel/pw_panel_config.json` 里，不会上传到别的地方。
+配置（包括各盒子的后台密码）只保存在服务器的 `/opt/pw-panel/pw_panel_config.json` 里，历史记录在 `/opt/pw-panel/pw_panel_history.jsonl`，都不会上传到别的地方。
