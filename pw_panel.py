@@ -1237,34 +1237,86 @@ class Handler(BaseHTTPRequestHandler):
 PAGE = r"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>PassWall 节点面板</title>
 <style>
-:root{--bg:#f5f6f8;--card:#fff;--line:#e6e8ec;--text:#141821;--muted:#6b7280;--ok:#16a34a;--warn:#d97706;--bad:#dc2626;--off:#9ca3af;--pri:#2563eb}
-*{box-sizing:border-box}body{margin:0;font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text)}
-header{position:sticky;top:0;z-index:5;background:var(--card);border-bottom:1px solid var(--line);padding:12px 20px;display:flex;flex-wrap:wrap;gap:12px;align-items:center}
-h1{font-size:17px;margin:0 12px 0 0}.sum{display:flex;gap:8px;flex-wrap:wrap}.chip{padding:2px 10px;border-radius:99px;background:#f0f1f3;font-size:13px;cursor:pointer;border:1px solid transparent}
-.chip.on{border-color:var(--text)}.actions{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-input,select,textarea{font:inherit;padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:#fff;color:var(--text)}
-button{font:inherit;padding:6px 12px;border:1px solid var(--line);border-radius:7px;background:#fff;cursor:pointer;white-space:nowrap}
-button:hover{border-color:#c9ccd2}button.pri{background:var(--pri);border-color:var(--pri);color:#fff}button.danger{color:var(--bad)}
-button:disabled{opacity:.5;cursor:wait}button.sm{padding:3px 9px;font-size:13px}
-main{padding:16px 20px}table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}
-th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}th{font-weight:600;font-size:13px;color:var(--muted);background:#fafbfc}
-tr:last-child td{border-bottom:0}th,td:first-child,.nw{white-space:nowrap}.muted{color:var(--muted)}.small{font-size:12px}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px}.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.off{color:var(--off)}
-.bg-ok{background:var(--ok)}.bg-bad{background:var(--bad)}.bg-warn{background:var(--warn)}.bg-off{background:var(--off)}
-.ops{display:flex;gap:5px;flex-wrap:wrap}.tag{font-size:12px;padding:1px 7px;border-radius:5px;background:#eef2ff;color:var(--pri)}
-.modal{position:fixed;inset:0;background:rgba(15,18,25,.45);display:flex;align-items:flex-start;justify-content:center;padding:40px 12px;z-index:10;overflow:auto}
-.modal[hidden]{display:none}.box{background:#fff;border-radius:12px;width:min(860px,100%);box-shadow:0 10px 40px rgba(0,0,0,.2)}
-.mh{display:flex;align-items:center;padding:14px 18px;border-bottom:1px solid var(--line)}.mh b{font-size:15px}.mh button{margin-left:auto;border:0;font-size:20px;padding:0 6px}
-.mb{padding:16px 18px}.form{display:grid;grid-template-columns:150px 1fr;gap:10px 12px;align-items:center}.form .full{grid-column:1/-1}
-.sec{font-weight:600;margin-top:8px;grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px}
-.log{background:#0f1218;color:#d1d5db;border-radius:8px;padding:12px;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;max-height:420px;overflow:auto}
-#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#141821;color:#fff;padding:10px 16px;border-radius:8px;opacity:0;transition:.25s;pointer-events:none;z-index:20;max-width:90vw}
-#toast.show{opacity:1}.cur{background:#f0fdf4}.pwset{border:1px solid var(--line);border-radius:10px;padding:4px 12px;background:#fafbfc}
-.pwrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--line)}.pwrow:last-child{border-bottom:0}.pwrow>b{min-width:70px}
-.pwrow select{max-width:260px}.wf{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.45}.wf.off{text-decoration:line-through}.empty{padding:40px;text-align:center;color:var(--muted);background:#fff;border:1px dashed var(--line);border-radius:10px}
-@media(max-width:760px){.hide-m{display:none}th,td{padding:7px 6px}.form{grid-template-columns:1fr}}
+:root{
+ --bg:#F5F4EE;--card:#FFFFFF;--soft:#FAF9F5;--line:#E8E6DC;--line2:#DEDBCF;
+ --text:#1F1E1D;--muted:#7A786F;--faint:#A8A69C;
+ --pri:#D97757;--pri-d:#C2603F;--pri-t:#FBEEE8;--pri-t2:#F6DED3;
+ --ok:#3B8A5A;--ok-t:#E8F3EC;--warn:#B7791F;--warn-t:#FBF1DE;--bad:#B9433A;--bad-t:#F9E7E4;--off:#9A988E;--off-t:#EFEEE8;
+ --serif:"Iowan Old Style","Palatino Linotype",Georgia,"Songti SC","STSong",serif;
+ --r:12px;--sh:0 1px 2px rgba(31,30,29,.04),0 2px 8px rgba(31,30,29,.04)}
+*{box-sizing:border-box}
+body{margin:0;font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased}
+::selection{background:var(--pri-t2)}
+/* 顶栏 */
+header{position:sticky;top:0;z-index:5;background:rgba(245,244,238,.92);backdrop-filter:saturate(1.4) blur(10px);border-bottom:1px solid var(--line);padding:14px 28px;display:flex;flex-wrap:wrap;gap:14px;align-items:center}
+.brand{display:flex;align-items:center;gap:10px;margin-right:10px}
+.logo{width:30px;height:30px;border-radius:9px;background:var(--pri);color:#fff;display:grid;place-items:center;font-size:17px;box-shadow:0 2px 6px rgba(217,119,87,.35)}
+h1{font-family:var(--serif);font-size:21px;font-weight:600;letter-spacing:.2px;margin:0}
+h1 small{font-family:inherit;font-size:13px;color:var(--muted);font-weight:400;margin-left:6px}
+.sum{display:flex;gap:6px;flex-wrap:wrap}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:4px 11px;border-radius:99px;background:var(--card);border:1px solid var(--line);font-size:13px;cursor:pointer;color:var(--text);transition:.15s;user-select:none}
+.chip:hover{border-color:var(--line2);background:var(--soft)}
+.chip.on{background:var(--pri-t);border-color:var(--pri);color:var(--pri-d);font-weight:600}
+.chip b{font-weight:600}
+.actions{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+/* 表单控件 */
+input,select,textarea{font:inherit;padding:7px 11px;border:1px solid var(--line2);border-radius:9px;background:#fff;color:var(--text);outline:none;transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--pri);box-shadow:0 0 0 3px var(--pri-t)}
+input[type=checkbox]{accent-color:var(--pri);width:15px;height:15px;padding:0}
+#q{width:220px;background:#fff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' fill='none' stroke='%239A988E' stroke-width='2'%3E%3Ccircle cx='6' cy='6' r='4.5'/%3E%3Cpath d='M9.5 9.5L13 13'/%3E%3C/svg%3E") no-repeat 11px center;padding-left:32px}
+button{font:inherit;padding:7px 14px;border:1px solid var(--line2);border-radius:9px;background:#fff;color:var(--text);cursor:pointer;white-space:nowrap;transition:.15s}
+button:hover{background:var(--soft);border-color:#CFCBBE}
+button:active{transform:translateY(.5px)}
+button.pri{background:var(--pri);border-color:var(--pri);color:#fff;box-shadow:0 1px 2px rgba(194,96,63,.25)}
+button.pri:hover{background:var(--pri-d);border-color:var(--pri-d)}
+button.danger{color:var(--bad);border-color:#EBC9C4}button.danger:hover{background:var(--bad-t)}
+button:disabled{opacity:.55;cursor:wait}
+button.sm{padding:4px 10px;font-size:13px;border-radius:8px}
+a{color:var(--pri-d)}
+/* 主体 */
+main{padding:20px 28px 40px;max-width:1680px;margin:0 auto}
+#meta{display:flex;align-items:center;gap:6px}
+#meta:before{content:"";width:6px;height:6px;border-radius:50%;background:var(--ok)}
+table{width:100%;border-collapse:separate;border-spacing:0;background:var(--card);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;box-shadow:var(--sh)}
+th,td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:left;vertical-align:middle}
+th{font-weight:600;font-size:12px;color:var(--muted);background:var(--soft);letter-spacing:.3px}
+tbody tr{transition:background .12s}tbody tr:hover{background:#FCFBF8}
+tr:last-child td{border-bottom:0}th,td:first-child,.nw{white-space:nowrap}
+.muted{color:var(--muted)}.small{font-size:12px}
+.ok{color:var(--ok)}.bad{color:var(--bad)}.warn{color:var(--warn)}.off{color:var(--off)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%}
+.bg-ok{background:var(--ok)}.bg-bad{background:var(--bad)}.bg-warn{background:var(--warn)}.bg-off{background:var(--faint)}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:3px 10px 3px 8px;border-radius:99px;font-size:12.5px;font-weight:600}
+.pill i{width:6px;height:6px;border-radius:50%;background:currentColor}
+.p-ok{background:var(--ok-t);color:var(--ok)}.p-bad{background:var(--bad-t);color:var(--bad)}.p-warn{background:var(--warn-t);color:var(--warn)}.p-off{background:var(--off-t);color:var(--off)}
+.ops{display:flex;gap:5px;flex-wrap:wrap}
+.tag{font-size:11.5px;padding:1px 7px;border-radius:6px;background:var(--pri-t);color:var(--pri-d);font-weight:600;vertical-align:1px}
+td b{font-weight:600}
+/* 弹窗 */
+.modal{position:fixed;inset:0;background:rgba(31,30,29,.38);backdrop-filter:blur(2px);display:flex;align-items:flex-start;justify-content:center;padding:44px 14px;z-index:10;overflow:auto;animation:fade .15s}
+.modal[hidden]{display:none}
+.box{background:var(--card);border-radius:16px;width:min(900px,100%);box-shadow:0 20px 60px rgba(31,30,29,.22);animation:pop .18s ease-out}
+@keyframes fade{from{opacity:0}}@keyframes pop{from{opacity:0;transform:translateY(8px) scale(.99)}}
+.mh{display:flex;align-items:center;padding:16px 22px;border-bottom:1px solid var(--line)}
+.mh b{font-family:var(--serif);font-size:18px;font-weight:600}
+.mh button{margin-left:auto;border:0;font-size:22px;padding:0 8px;color:var(--muted);background:none;line-height:1}
+.mh button:hover{color:var(--text)}
+.mb{padding:18px 22px 22px}
+.mb table{box-shadow:none}
+.form{display:grid;grid-template-columns:170px 1fr;gap:10px 14px;align-items:center}.form .full{grid-column:1/-1}
+.sec{font-family:var(--serif);font-weight:600;font-size:15px;margin-top:10px;grid-column:1/-1;border-top:1px solid var(--line);padding-top:14px;color:var(--pri-d)}
+.log{background:#262624;color:#E8E6DC;border-radius:10px;padding:14px;font:13px/1.7 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;max-height:420px;overflow:auto}
+#toast{position:fixed;bottom:24px;left:50%;transform:translate(-50%,8px);background:#262624;color:#FAF9F5;padding:11px 18px;border-radius:11px;opacity:0;transition:.22s;pointer-events:none;z-index:20;max-width:90vw;box-shadow:0 8px 24px rgba(0,0,0,.18)}
+#toast.show{opacity:1;transform:translate(-50%,0)}
+.cur{background:#FBF5F1 !important}.cur td:first-child{box-shadow:inset 3px 0 0 var(--pri)}
+.empty{padding:56px;text-align:center;color:var(--muted);background:var(--card);border:1px dashed var(--line2);border-radius:var(--r);font-size:15px}
+.wf{max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.5}.wf.off{text-decoration:line-through}
+.pwset{border:1px solid var(--line);border-radius:12px;padding:4px 14px;background:var(--soft)}
+.pwrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 0;border-bottom:1px solid var(--line)}.pwrow:last-child{border-bottom:0}
+.pwrow>b{min-width:74px;font-weight:600}.pwrow select{max-width:270px}
+@media(max-width:760px){header{padding:12px 14px}main{padding:14px}.hide-m{display:none}th,td{padding:8px 7px}.form{grid-template-columns:1fr}#q{width:100%}}
 </style></head><body>
-<header><h1>PassWall 节点面板</h1><div class="sum" id="sum"></div>
+<header><div class="brand"><div class="logo">✳</div><h1>PassWall 节点面板</h1></div><div class="sum" id="sum"></div>
 <div class="actions"><input id="q" placeholder="搜索名称 / WiFi / 备注 / 端口" oninput="render()" style="width:180px">
 <button class="pri" id="btnAll" onclick="checkAll()">全部检测</button><button onclick="openImport()">从 frps 导入</button>
 <button onclick="editRouter()">添加盒子</button><button onclick="openSettings()">设置</button></div></header>
@@ -1296,8 +1348,8 @@ function lvl(r){const l=r.status&&r.status.level;return LV[l]?l:"none"}
 async function load(){try{S=await api("/api/state");render()}catch(e){}}
 function render(){
  const q=$("q").value.trim().toLowerCase();const cnt={};S.routers.forEach(r=>{const l=lvl(r);cnt[l]=(cnt[l]||0)+1});
- $("sum").innerHTML=`<span class="chip ${FILTER===null?"on":""}" onclick="FILTER=null;render()">全部 ${S.routers.length}</span>`+
-  Object.keys(ORD).filter(k=>cnt[k]).map(k=>`<span class="chip ${FILTER===k?"on":""}" onclick="FILTER='${k}';render()"><span class="dot bg-${LV[k][1]}"></span>${LV[k][0]} ${cnt[k]}</span>`).join("");
+ $("sum").innerHTML=`<span class="chip ${FILTER===null?"on":""}" onclick="FILTER=null;render()">全部 <b>${S.routers.length}</b></span>`+
+  Object.keys(ORD).filter(k=>cnt[k]).map(k=>`<span class="chip ${FILTER===k?"on":""}" onclick="FILTER='${k}';render()"><span class="dot bg-${LV[k][1]}"></span>${LV[k][0]} <b>${cnt[k]}</b></span>`).join("");
  $("meta").textContent=(S.checking?"正在全部检测… ":"")+"上次全部检测："+ago(S.last_full)+(S.interval>0?`，每 ${S.interval} 分钟自动检测`:"，自动检测已关闭");
  $("btnAll").disabled=!!S.checking;$("btnAll").textContent=S.checking?"检测中…":"全部检测";
  let rs=S.routers.filter(r=>(!q||[r.name,r.note,r.port,r.frp_name,...((r.status&&r.status.wifi)||[]).map(w=>w.ssid)].join(" ").toLowerCase().includes(q))&&(FILTER===null||lvl(r)===FILTER));
@@ -1305,12 +1357,12 @@ function render(){
  if(!S.routers.length){$("list").innerHTML='<div class="empty">还没有盒子。先点「设置」填 frps 面板账号和后台默认密码，再点「从 frps 导入」。</div>';return}
  $("list").innerHTML=`<table><thead><tr><th>状态</th><th>盒子</th><th>WiFi</th><th class="hide-m">端口</th><th class="hide-m">frp</th><th>当前节点</th><th>外网</th><th class="hide-m">国内</th><th class="hide-m">检测</th><th>操作</th></tr></thead><tbody>`+
  rs.map(r=>{const s=r.status||{},l=lvl(r),[lt,lc]=LV[l];
-  return `<tr><td><span class="dot bg-${lc}"></span><b class="${lc}">${lt}</b></td>
+  return `<tr><td><span class="pill p-${lc}"><i></i>${lt}</span></td>
   <td><b>${esc(r.name)}</b>${r.auto_switch?' <span class="tag" title="已开启自动切换节点">自动</span>':""}${r.note?` <span class="muted small">${esc(r.note)}</span>`:""}
   ${r.auto_running?'<div class="small warn">⟳ 正在自动切换节点…</div>':(s.msg?`<div class="small ${lc}">${esc(s.msg)}</div>`:"")}
   ${r.auto_log&&Date.now()/1000-r.auto_log.time<86400?`<div class="small ${r.auto_log.fixed?"ok":"bad"}">⟳ ${ago(r.auto_log.time)}：${esc(r.auto_log.text)}</div>`:""}</td>
   <td>${wifiCell(s.wifi)}</td><td class="hide-m">${esc(r.port)}</td><td class="hide-m nw">${s.frp===true?'<span class="ok">在线</span>':s.frp===false?'<span class="bad">离线</span>':'<span class="off">—</span>'}</td>
-  <td>${esc(s.node_name||"—")}${s.node_count?` <span class="muted small">共${s.node_count}个</span>`:""}</td>
+  <td>${esc(s.node_name||"—")}${s.node_count?` <span class="muted small nw">共${s.node_count}个</span>`:""}</td>
   <td>${net(s.google)}</td><td class="hide-m">${net(s.baidu)}</td><td class="hide-m muted small nw">${ago(s.time)}</td>
   <td><div class="ops"><button class="sm" onclick="checkOne('${r.id}',this)">检测</button><button class="sm" onclick="openNodes('${r.id}')">节点</button><button class="sm" onclick="openWifi('${r.id}')">WiFi</button>
   ${l==="node_bad"?`<button class="sm pri" onclick="autofix('${r.id}')">一键修复</button>`:""}
