@@ -259,6 +259,71 @@ class Router:
                         "disabled": v.get("disabled") == "1" or d.get("disabled", False)})
         return out
 
+    def wifi_detail(self):
+        """读每个 WiFi 的完整信息（含密码），给编辑用"""
+        try:
+            vals = self.ubus("uci", "get", {"config": "wireless"}).get("values") or {}
+        except Err as e:
+            raise Err(f"读不到无线配置（这台可能没有 WiFi）：{e}")
+        devs = {}
+        for k, v in vals.items():
+            if v.get(".type") == "wifi-device":
+                band = (v.get("band") or "").lower(); hw = (v.get("hwmode") or "").lower(); ch = str(v.get("channel") or "")
+                devs[k] = ({"2g": "2.4G", "5g": "5G", "6g": "6G"}.get(band) or
+                           ("5G" if hw.endswith("a") or (ch.isdigit() and int(ch) > 14) else ("2.4G" if hw else "")))
+        out = []
+        for _, k, v in sorted((v.get(".index", 0), k, v) for k, v in vals.items() if v.get(".type") == "wifi-iface"):
+            if (v.get("mode") or "ap") != "ap":
+                continue
+            out.append({"id": k, "ssid": v.get("ssid", ""), "key": v.get("key", ""),
+                        "encryption": v.get("encryption", "none"), "band": devs.get(v.get("device"), ""),
+                        "disabled": v.get("disabled") == "1", "device": v.get("device", "")})
+        if not out:
+            raise Err("这台盒子没有 WiFi（可能是外接 AP 的软路由）")
+        return out
+
+    def wifi_save(self, changes):
+        cur = {x["id"]: x for x in self.wifi_detail()}
+        todo = []
+        for ch in changes:
+            old = cur.get(ch.get("id"))
+            if not old:
+                raise Err("WiFi 配置已变化，请关掉窗口重新打开")
+            ssid = str(ch.get("ssid", old["ssid"])).strip()
+            key = str(ch.get("key", old["key"]))
+            dis = bool(ch.get("disabled", old["disabled"]))
+            if not ssid or len(ssid.encode("utf-8")) > 32:
+                raise Err(f"WiFi 名「{ssid}」不能为空，且不能超过 32 字节（一个汉字 3 字节，约 10 个汉字）")
+            vals = {}
+            if ssid != old["ssid"]:
+                vals["ssid"] = ssid
+            if key != old["key"]:
+                if key == "":
+                    vals["encryption"] = "none"; vals["key"] = ""
+                else:
+                    if not (8 <= len(key) <= 63) or not key.isascii():
+                        raise Err("WiFi 密码要 8~63 位，只能用英文、数字和符号")
+                    vals["key"] = key
+                    if old["encryption"] in ("none", "", "owe"):
+                        vals["encryption"] = "psk2"
+            if dis != old["disabled"]:
+                vals["disabled"] = "1" if dis else "0"
+            if vals:
+                todo.append((old["id"], vals))
+        if not todo:
+            return 0
+        for sid, vals in todo:
+            self.ubus("uci", "set", {"config": "wireless", "section": sid, "values": vals})
+        self.ubus("uci", "commit", {"config": "wireless"})
+        try:
+            self.ubus("network", "reload", {}, timeout=30)
+        except Err:
+            try:
+                self.ubus("file", "exec", {"command": "/sbin/wifi", "params": ["reload"]}, timeout=40)
+            except Err:
+                raise Err("已保存，但无线没能自动重载，重启一下盒子才会生效")
+        return len(todo)
+
     def node(self, nid):
         for n in (self.cfg or self.load_config())["nodes"]:
             if n["id"] == nid:
@@ -678,6 +743,26 @@ def api_restart(b):
     return {"status": STATUS.get(r["id"])}
 
 
+def api_wifi(b):
+    c = client_for(b)
+    return {"items": c.wifi_detail()}
+
+
+def api_wifi_save(b):
+    r = get_router(b["id"])
+    c = client_for(b)
+    try:
+        n = c.wifi_save(b.get("changes") or [])
+    except NETERR:
+        n = -1  # 重载无线时连接被断开，通常已经生效
+    try:
+        if r["id"] in STATUS:
+            STATUS[r["id"]]["wifi"] = Router(r).login().wifi()
+    except Exception:
+        pass
+    return {"changed": n}
+
+
 def api_router_save(b):
     port = str(b.get("port", "")).strip()
     if not port.isdigit():
@@ -785,7 +870,7 @@ def api_test_notify(_):
 
 POST_ROUTES = {
     "/api/check": api_check, "/api/nodes": api_nodes, "/api/test_node": api_test_node,
-    "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart,
+    "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart, "/api/wifi": api_wifi, "/api/wifi/save": api_wifi_save,
     "/api/router/save": api_router_save, "/api/router/delete": api_router_delete,
     "/api/frps/scan": api_frps_scan, "/api/router/bulk_add": api_bulk_add,
     "/api/settings/save": api_settings_save, "/api/settings/test_notify": api_test_notify,
@@ -904,14 +989,14 @@ async function api(p,b){const o=b===undefined?{}:{method:"POST",headers:{"Conten
  const r=await fetch(p,o);const j=await r.json();if(b!==undefined&&!j.ok)throw new Error(j.error||"失败");return j}
 function toast(t,ms=3000){const e=$("toast");e.textContent=t;e.classList.add("show");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove("show"),ms)}
 function openM(t,h){$("mt").textContent=t;$("mb").innerHTML=h;$("modal").hidden=false}
-function closeM(){$("modal").hidden=true;NODES=null}
+function closeM(){$("modal").hidden=true;NODES=null;WIFI=null}
 function ago(ts){if(!ts)return"—";const s=Math.round(Date.now()/1000-ts);return s<60?s+"秒前":s<3600?Math.round(s/60)+"分钟前":Math.round(s/3600)+"小时前"}
 function net(t){if(!t)return'<span class="off">—</span>';if(t.ok===null)return'<span class="off">未知</span>';return t.ok?`<span class="ok">${t.ms??"通"}${t.ms!=null?"ms":""}</span>`:'<span class="bad">不通</span>'}
 function wifiCell(w){if(w==null)return'<span class="off">—</span>';if(!w.length)return'<span class="off small">无 WiFi</span>';
  const g={};w.forEach(x=>{const k=x.ssid+"\u0000"+(x.disabled?1:0);(g[k]=g[k]||{ssid:x.ssid,dis:x.disabled,b:[]}).b.push(x.band)});
  return Object.values(g).sort((a,b)=>a.dis-b.dis).map(x=>{const b=[...new Set(x.b.filter(Boolean))].join("/");
   return `<div class="wf ${x.dis?"off":""}" title="${esc(x.ssid)}">${esc(x.ssid)}${b?` <span class="muted small">${b}</span>`:""}${x.dis?' <span class="small">已关</span>':""}</div>`}).join("")}
-function lvl(r){return r.status?r.status.level:"none"}
+function lvl(r){const l=r.status&&r.status.level;return LV[l]?l:"none"}
 async function load(){try{S=await api("/api/state");render()}catch(e){}}
 function render(){
  const q=$("q").value.trim().toLowerCase();const cnt={};S.routers.forEach(r=>{const l=lvl(r);cnt[l]=(cnt[l]||0)+1});
@@ -929,7 +1014,7 @@ function render(){
   <td>${wifiCell(s.wifi)}</td><td class="hide-m">${esc(r.port)}</td><td class="hide-m nw">${s.frp===true?'<span class="ok">在线</span>':s.frp===false?'<span class="bad">离线</span>':'<span class="off">—</span>'}</td>
   <td>${esc(s.node_name||"—")}${s.node_count?` <span class="muted small">共${s.node_count}个</span>`:""}</td>
   <td>${net(s.google)}</td><td class="hide-m">${net(s.baidu)}</td><td class="hide-m muted small nw">${ago(s.time)}</td>
-  <td><div class="ops"><button class="sm" onclick="checkOne('${r.id}',this)">检测</button><button class="sm" onclick="openNodes('${r.id}')">节点</button>
+  <td><div class="ops"><button class="sm" onclick="checkOne('${r.id}',this)">检测</button><button class="sm" onclick="openNodes('${r.id}')">节点</button><button class="sm" onclick="openWifi('${r.id}')">WiFi</button>
   ${l==="node_bad"?`<button class="sm pri" onclick="autofix('${r.id}')">一键修复</button>`:""}
   ${l==="dns_bad"?`<button class="sm pri" onclick="restartPW('${r.id}',this)">重启PassWall</button>`:""}
   <a href="${esc(r.luci_url)}" target="_blank"><button class="sm">后台</button></a><button class="sm" onclick="editRouter('${r.id}')">编辑</button></div></td></tr>`}).join("")+"</tbody></table>"}
@@ -962,6 +1047,30 @@ async function addLink(btn){const link=$("link").value.trim();if(!link)return to
  try{const r=await api("/api/add_link",{id,link,switch:$("sw").checked});const g=r.status&&r.status.google;
   toast("已添加："+r.added.map(x=>x.remarks).join("、")+(r.status?(g&&g.ok?`，已切换，外网正常 ${g.ms}ms`:"，已切换，但外网还是不通"):""),6000);await load();openNodes(id)}
  catch(e){toast(e.message,6000);btn.disabled=false;btn.textContent="添加节点"}}
+let WIFI=null;
+async function openWifi(id){openM(R(id).name+" · WiFi",'<p class="muted">正在读取 WiFi 设置…</p>');
+ try{const d=await api("/api/wifi",{id});WIFI={id,items:d.items};renderWifi()}catch(e){$("mb").innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
+function renderWifi(){const d=WIFI;
+ $("mb").innerHTML=`<p class="muted small">直接改名字或密码，然后点「保存」。密码留空 = 不设密码（开放 WiFi）。保存后无线会重启，客户的设备会断开几秒再自动重连（改了名字或密码的要重新连）。</p>
+ <table><thead><tr><th>频段</th><th>WiFi 名</th><th>密码</th><th>开启</th></tr></thead><tbody>`+
+ d.items.map((w,i)=>`<tr><td class="nw muted">${esc(w.band||"—")}</td>
+ <td><input id="ws${i}" value="${esc(w.ssid)}" maxlength="32" style="width:100%"></td>
+ <td><div style="display:flex;gap:4px"><input id="wk${i}" type="password" value="${esc(w.key)}" placeholder="无密码" style="width:100%"><button class="sm" onclick="const e=$('wk${i}');e.type=e.type==='password'?'text':'password'">显示</button></div></td>
+ <td><input type="checkbox" id="wd${i}" ${w.disabled?"":"checked"}></td></tr>`).join("")+
+ `</tbody></table><div style="display:flex;gap:10px;align-items:center;margin-top:12px">
+ ${d.items.length>1?'<button onclick="wifiSync()">把第一行的名字和密码同步到全部</button>':""}
+ <button class="pri" style="margin-left:auto" id="wsave" onclick="saveWifi()">保存</button></div>`}
+function wifiSync(){WIFI.items.forEach((w,i)=>{if(i){$("ws"+i).value=$("ws0").value;$("wk"+i).value=$("wk0").value}});toast("已填好，确认后点保存")}
+async function saveWifi(){const ch=[],msg=[];
+ WIFI.items.forEach((w,i)=>{const s=$("ws"+i).value.trim(),k=$("wk"+i).value,on=$("wd"+i).checked;
+  if(s!==w.ssid||k!==w.key||on===w.disabled){ch.push({id:w.id,ssid:s,key:k,disabled:!on});
+   msg.push(`${w.band||""} ${w.ssid}${s!==w.ssid?" → 名字改为「"+s+"」":""}${k!==w.key?(k?" → 改密码":" → 去掉密码"):""}${on===w.disabled?(on?" → 开启":" → 关闭"):""}`)}});
+ if(!ch.length)return toast("没有改动");
+ if(ch.some(c=>c.key&&c.key.length<8))return toast("WiFi 密码至少 8 位");
+ if(!confirm("确认修改：\n"+msg.join("\n")+"\n\n保存后无线会重启，客户设备会断开几秒。"))return;
+ const b=$("wsave");b.disabled=true;b.textContent="保存中…";
+ try{const r=await api("/api/wifi/save",{id:WIFI.id,changes:ch});toast(r.changed===-1?"已提交，无线正在重启":"已保存，无线已重启生效",5000);await load();if(WIFI)openWifi(WIFI.id)}
+ catch(e){toast(e.message,6000);b.disabled=false;b.textContent="保存"}}
 async function restartPW(id,btn){if(!confirm(`重启「${R(id).name}」的 PassWall？客户会断网十几秒。`))return;
  const t=btn?btn.textContent:"";if(btn){btn.disabled=true;btn.textContent="重启中…"}
  try{const r=await api("/api/restart",{id});const st=r.status||{};toast(st.level==="ok"?"重启完成，已恢复正常":"重启完成，当前状态："+(LV[st.level]||["?"])[0],5000);await load();if(NODES&&NODES.id===id)openNodes(id)}
