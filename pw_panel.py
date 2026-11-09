@@ -221,10 +221,69 @@ class Router:
                     "port": x.get("port", ""), "_i": x.get(".index", 0),
                 })
         nodes.sort(key=lambda n: n.pop("_i"))
-        opt = "tcp_node" if self.app == "passwall" else "node"
+        # 老版 PassWall 1：tcp_node + udp_node；新版 PassWall 1 和 PassWall 2：只有一个 node
+        has_udp = self.app == "passwall" and ("tcp_node" in glob or "udp_node" in glob)
+        opt = "tcp_node" if has_udp else "node"
+        if self.app == "passwall" and not has_udp and "node" not in glob:
+            opt = "tcp_node"  # 什么都没设过的老版本
+        tpm = glob.get("tcp_proxy_mode", "")
+        old_scheme = tpm in ("global", "gfwlist", "chnroute", "returnhome")
         self.cfg = {"app": self.app, "enabled": glob.get("enabled") == "1", "current": glob.get(opt),
-                    "global_section": glob.get(".name"), "opt": opt, "nodes": nodes}
+                    "global_section": glob.get(".name"), "opt": opt, "nodes": nodes,
+                    "has_udp": has_udp, "udp": glob.get("udp_node", "") if has_udp else None,
+                    "mode": self._mode_name(glob, old_scheme), "old_scheme": old_scheme}
         return self.cfg
+
+    MODES = {  # 和 PassWall 页面「切换」按钮完全一致
+        "gfw": {"use_gfw_list": "1", "chn_list": "0", "tcp_proxy_mode": "disable", "udp_proxy_mode": "disable"},
+        "chnroute": {"use_gfw_list": "1", "chn_list": "direct", "tcp_proxy_mode": "proxy", "udp_proxy_mode": "proxy"},
+        "returnhome": {"use_gfw_list": "0", "chn_list": "proxy", "tcp_proxy_mode": "disable", "udp_proxy_mode": "disable"},
+        "global": {"use_gfw_list": "0", "chn_list": "0", "tcp_proxy_mode": "proxy", "udp_proxy_mode": "proxy"},
+    }
+    OLD_MODES = {"gfw": "gfwlist", "chnroute": "chnroute", "returnhome": "returnhome", "global": "global"}
+
+    @classmethod
+    def _mode_name(cls, g, old_scheme):
+        if old_scheme:
+            return {v: k for k, v in cls.OLD_MODES.items()}.get(g.get("tcp_proxy_mode"), "")
+        cur = {k: g.get(k, "") for k in ("use_gfw_list", "chn_list", "tcp_proxy_mode", "udp_proxy_mode")}
+        for name, vals in cls.MODES.items():
+            if all(cur[k] == v for k, v in vals.items() if k != "udp_proxy_mode"):
+                return name
+        return "custom"
+
+    def set_global(self, enabled=None, tcp=None, udp=None, mode=None):
+        """改 PassWall 全局设置（总开关 / 节点 / 模式），保存后重启 PassWall"""
+        cfg = self.load_config()
+        vals = {}
+        if enabled is not None:
+            vals["enabled"] = "1" if enabled else "0"
+        ids = {n["id"] for n in cfg["nodes"]}
+        if tcp is not None:
+            if tcp not in ids:
+                raise Err("选择的节点不存在")
+            vals[cfg["opt"]] = tcp
+        if udp is not None:
+            if not cfg["has_udp"]:
+                raise Err("这个 PassWall 版本没有单独的 UDP 节点")
+            if udp not in ids and udp not in ("tcp", "nil", ""):
+                raise Err("选择的 UDP 节点不存在")
+            vals["udp_node"] = udp
+        if mode is not None:
+            if mode not in self.MODES:
+                raise Err("未知模式")
+            if cfg["old_scheme"]:
+                vals["tcp_proxy_mode"] = vals["udp_proxy_mode"] = self.OLD_MODES[mode]
+            else:
+                vals.update(self.MODES[mode])
+        if not vals:
+            return
+        self.ubus("uci", "set", {"config": cfg["app"], "section": cfg["global_section"], "values": vals})
+        self.uci_save(cfg["app"])
+        try:
+            self.restart()
+        except NETERR:
+            pass
 
     def wifi(self):
         """读无线配置，返回 [{ssid, band, disabled}]；没有无线或读不到返回 []"""
@@ -742,7 +801,19 @@ def client_for(b):
 def api_nodes(b):
     c = client_for(b)
     cfg = c.load_config()
-    return {"app": cfg["app"], "enabled": cfg["enabled"], "current": cfg["current"], "nodes": cfg["nodes"]}
+    return {k: cfg[k] for k in ("app", "enabled", "current", "nodes", "has_udp", "udp", "mode")}
+
+
+def api_pw_set(b):
+    r = get_router(b["id"])
+    c = client_for(b)
+    try:
+        c.set_global(enabled=b.get("enabled"), tcp=b.get("tcp"), udp=b.get("udp"), mode=b.get("mode"))
+    except NETERR:
+        pass  # 重启 PassWall 时连接被断开是正常的
+    time.sleep(3)
+    check_many([r["id"]])
+    return {"status": STATUS.get(r["id"])}
 
 
 def api_test_node(b):
@@ -979,7 +1050,7 @@ def api_test_notify(_):
 
 POST_ROUTES = {
     "/api/check": api_check, "/api/nodes": api_nodes, "/api/test_node": api_test_node,
-    "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart, "/api/wifi": api_wifi, "/api/wifi/save": api_wifi_save,
+    "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart, "/api/pw_set": api_pw_set, "/api/wifi": api_wifi, "/api/wifi/save": api_wifi_save,
     "/api/router/save": api_router_save, "/api/router/delete": api_router_delete,
     "/api/frps/scan": api_frps_scan, "/api/router/bulk_add": api_bulk_add,
     "/api/settings/save": api_settings_save, "/api/settings/test_notify": api_test_notify,
@@ -1078,7 +1149,9 @@ tr:last-child td{border-bottom:0}th,td:first-child,.nw{white-space:nowrap}.muted
 .sec{font-weight:600;margin-top:8px;grid-column:1/-1;border-top:1px solid var(--line);padding-top:12px}
 .log{background:#0f1218;color:#d1d5db;border-radius:8px;padding:12px;font:13px/1.6 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap;max-height:420px;overflow:auto}
 #toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#141821;color:#fff;padding:10px 16px;border-radius:8px;opacity:0;transition:.25s;pointer-events:none;z-index:20;max-width:90vw}
-#toast.show{opacity:1}.cur{background:#f0fdf4}.wf{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.45}.wf.off{text-decoration:line-through}.empty{padding:40px;text-align:center;color:var(--muted);background:#fff;border:1px dashed var(--line);border-radius:10px}
+#toast.show{opacity:1}.cur{background:#f0fdf4}.pwset{border:1px solid var(--line);border-radius:10px;padding:4px 12px;background:#fafbfc}
+.pwrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 0;border-bottom:1px solid var(--line)}.pwrow:last-child{border-bottom:0}.pwrow>b{min-width:70px}
+.pwrow select{max-width:260px}.wf{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;line-height:1.45}.wf.off{text-decoration:line-through}.empty{padding:40px;text-align:center;color:var(--muted);background:#fff;border:1px dashed var(--line);border-radius:10px}
 @media(max-width:760px){.hide-m{display:none}th,td{padding:7px 6px}.form{grid-template-columns:1fr}}
 </style></head><body>
 <header><h1>PassWall 节点面板</h1><div class="sum" id="sum"></div>
@@ -1129,6 +1202,7 @@ function render(){
   <td>${net(s.google)}</td><td class="hide-m">${net(s.baidu)}</td><td class="hide-m muted small nw">${ago(s.time)}</td>
   <td><div class="ops"><button class="sm" onclick="checkOne('${r.id}',this)">检测</button><button class="sm" onclick="openNodes('${r.id}')">节点</button><button class="sm" onclick="openWifi('${r.id}')">WiFi</button>
   ${l==="node_bad"?`<button class="sm pri" onclick="autofix('${r.id}')">一键修复</button>`:""}
+  ${l==="disabled"?`<button class="sm pri" onclick="quickEnable('${r.id}',this)">打开PassWall</button>`:""}
   ${l==="dns_bad"?`<button class="sm pri" onclick="restartPW('${r.id}',this)">重启PassWall</button>`:""}
   <a href="${esc(r.luci_url)}" target="_blank"><button class="sm">后台</button></a><button class="sm" onclick="editRouter('${r.id}')">编辑</button></div></td></tr>`}).join("")+"</tbody></table>"}
 async function checkAll(){$("btnAll").disabled=true;$("btnAll").textContent="检测中…";try{S=await api("/api/check",{});render();toast("全部检测完成")}catch(e){toast(e.message);load()}}
@@ -1136,9 +1210,23 @@ async function checkOne(id,btn){btn.disabled=true;btn.textContent="…";try{S=aw
 const R=id=>S.routers.find(r=>r.id===id);
 async function openNodes(id){openM(R(id).name+" · 节点",'<p class="muted">正在登录后台读取节点…</p>');
  try{const d=await api("/api/nodes",{id});NODES={id,...d,lat:{}};renderNodes()}catch(e){$("mb").innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
+const MODES=[["gfw","GFW 列表"],["chnroute","中国列表以外"],["returnhome","中国列表"],["global","全局代理"]];
+function nodeOpts(d,sel,extra){return (extra||[]).map(([v,t])=>`<option value="${v}" ${v===sel?"selected":""}>${t}</option>`).join("")+
+ d.nodes.map(n=>`<option value="${esc(n.id)}" ${n.id===sel?"selected":""}>${esc(n.remarks)}${n.protocol?" ["+esc(n.protocol)+"]":""}</option>`).join("")}
 function renderNodes(){if(!NODES)return;const d=NODES;
- $("mb").innerHTML=`<div style="display:flex;gap:8px;align-items:center;margin-bottom:10px"><span class="muted">${esc(d.app)} · 总开关${d.enabled?'<span class="ok">已开</span>':'<span class="bad">未开</span>'} · ${d.nodes.length} 个节点</span>
- <button class="sm" style="margin-left:auto" onclick="restartPW(NODES.id,this)">重启PassWall</button><button class="sm" onclick="testAll(this)">全部测速</button></div>
+ const curMode=(MODES.find(m=>m[0]===d.mode)||[0,d.mode==="custom"?"自定义":"未知"])[1];
+ $("mb").innerHTML=`<div class="pwset">
+ <div class="pwrow"><b>总开关</b><span>${d.enabled?'<span class="ok">● 已开启</span>':'<span class="bad">● 已关闭</span>'}</span>
+  <button class="sm ${d.enabled?"danger":"pri"}" onclick="pwSet({enabled:${!d.enabled}},'${d.enabled?"关闭":"打开"} PassWall？'+(${d.enabled}?'关闭后客户将无法访问外网。':''),this)">${d.enabled?"关闭 PassWall":"打开 PassWall"}</button>
+  <span style="margin-left:auto"></span><button class="sm" onclick="restartPW(NODES.id,this)">重启PassWall</button></div>
+ <div class="pwrow"><b>${d.has_udp?"TCP 节点":"节点"}</b><select id="selTcp">${nodeOpts(d,d.current,d.current?[]:[["","（未选择）"]])}</select>
+  ${d.has_udp?`<b style="margin-left:8px">UDP 节点</b><select id="selUdp">${nodeOpts(d,d.udp||"nil",[["nil","关闭"],["tcp","与 TCP 节点相同"]])}</select>`:""}
+  <button class="sm pri" onclick="saveNodesSel(this)">保存</button></div>
+ <div class="pwrow"><b>代理模式</b><span class="muted small">当前：${esc(curMode)}</span>
+  ${MODES.map(([k,t])=>`<button class="sm ${d.mode===k?"pri":""}" onclick="pwSet({mode:'${k}'},'切换到「${t}」模式？',this)">${t}</button>`).join("")}</div>
+ </div>
+ <div style="display:flex;gap:8px;align-items:center;margin:14px 0 8px"><b>节点列表</b><span class="muted small">${d.nodes.length} 个</span>
+ <button class="sm" style="margin-left:auto" onclick="testAll(this)">全部测速</button></div>
  <table><thead><tr><th>节点</th><th class="hide-m">类型</th><th class="hide-m">地址</th><th>延迟</th><th></th></tr></thead><tbody>`+
  d.nodes.map(n=>{const c=n.id===d.current,t=d.lat[n.id];
   return `<tr class="${c?"cur":""}"><td>${c?'<span class="tag">当前</span> ':""}${esc(n.remarks)}</td><td class="hide-m muted small">${esc(n.type)} ${esc(n.protocol)}</td>
@@ -1160,6 +1248,16 @@ async function addLink(btn){const link=$("link").value.trim();if(!link)return to
  try{const r=await api("/api/add_link",{id,link,switch:$("sw").checked});const g=r.status&&r.status.google;
   toast("已添加："+r.added.map(x=>x.remarks).join("、")+(r.status?(g&&g.ok?`，已切换，外网正常 ${g.ms}ms`:"，已切换，但外网还是不通"):""),6000);await load();openNodes(id)}
  catch(e){toast(e.message,6000);btn.disabled=false;btn.textContent="添加节点"}}
+async function pwSet(body,q,btn){if(q&&!await ask(q+"\n\nPassWall 会重启，客户会断网十几秒。"))return;const id=NODES.id;
+ const t=btn?btn.textContent:"";if(btn){btn.disabled=true;btn.textContent="处理中…"}
+ try{const r=await api("/api/pw_set",{id,...body});const st=r.status||{};
+  toast("已生效，当前状态："+((LV[st.level]||["?"])[0])+(st.google&&st.google.ok?`，外网 ${st.google.ms}ms`:""),5000);await load();if(NODES&&NODES.id===id)openNodes(id)}
+ catch(e){toast(e.message,6000);if(btn){btn.disabled=false;btn.textContent=t}}}
+async function saveNodesSel(btn){const d=NODES,b={};const t=$("selTcp").value;if(t&&t!==d.current)b.tcp=t;
+ if(d.has_udp){const u=$("selUdp").value;if(u!==(d.udp||"nil"))b.udp=u}
+ if(!Object.keys(b).length)return toast("节点没有变化");
+ const name=id=>({nil:"关闭",tcp:"与 TCP 节点相同"})[id]||(d.nodes.find(n=>n.id===id)||{}).remarks||id;
+ await pwSet(b,(b.tcp?`${d.has_udp?"TCP ":""}节点改为「${name(b.tcp)}」`:"")+(b.udp?(b.tcp?"\n":"")+`UDP 节点改为「${name(b.udp)}」`:""),btn)}
 let WIFI=null;
 async function openWifi(id){openM(R(id).name+" · WiFi",'<p class="muted">正在读取 WiFi 设置…</p>');
  try{const d=await api("/api/wifi",{id});WIFI={id,items:d.items};renderWifi()}catch(e){$("mb").innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
@@ -1185,6 +1283,9 @@ async function saveWifi(){const ch=[],msg=[];
  const b=$("wsave");b.disabled=true;b.textContent="保存中…";wmsg("正在保存并重启无线，约 10~30 秒…");
  try{const r=await api("/api/wifi/save",{id:WIFI.id,changes:ch});toast(r.changed===-1?"已提交，无线正在重启":"已保存，无线已重启生效",5000);await load();if(WIFI)openWifi(WIFI.id)}
  catch(e){wmsg(e.message,"bad");b.disabled=false;b.textContent="保存"}}
+async function quickEnable(id,btn){if(!await ask(`打开「${R(id).name}」的 PassWall？`))return;btn.disabled=true;btn.textContent="打开中…";
+ try{const r=await api("/api/pw_set",{id,enabled:true});const st=r.status||{};toast("已打开，当前状态："+((LV[st.level]||["?"])[0]),5000);await load()}
+ catch(e){toast(e.message,6000);btn.disabled=false;btn.textContent="打开PassWall"}}
 async function restartPW(id,btn){if(!await ask(`重启「${R(id).name}」的 PassWall？客户会断网十几秒。`))return;
  const t=btn?btn.textContent:"";if(btn){btn.disabled=true;btn.textContent="重启中…"}
  try{const r=await api("/api/restart",{id});const st=r.status||{};toast(st.level==="ok"?"重启完成，已恢复正常":"重启完成，当前状态："+(LV[st.level]||["?"])[0],5000);await load();if(NODES&&NODES.id===id)openNodes(id)}
