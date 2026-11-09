@@ -13,7 +13,11 @@ command -v python3 >/dev/null || {
 }
 mkdir -p "$DIR"
 echo "下载面板程序 ..."
-curl -fsSL "https://raw.githubusercontent.com/$REPO/main/pw_panel.py" -o "$DIR/pw_panel.py.new"
+# 按最新提交编号下载，避开 raw.githubusercontent.com 约 5 分钟的缓存
+SHA=$(curl -fsSL --max-time 10 "https://api.github.com/repos/$REPO/commits/main" 2>/dev/null | grep -m1 '"sha"' | cut -d'"' -f4)
+REF="${SHA:-main}"
+curl -fsSL "https://raw.githubusercontent.com/$REPO/$REF/pw_panel.py?t=$(date +%s)" -o "$DIR/pw_panel.py.new"
+echo "版本：${REF:0:7}"
 python3 -m py_compile "$DIR/pw_panel.py.new" && mv "$DIR/pw_panel.py.new" "$DIR/pw_panel.py"
 
 cat > /etc/systemd/system/pw-panel.service <<SVC
@@ -46,6 +50,7 @@ USER_=$(python3 -c "import json;print(json.load(open('$DIR/pw_panel_config.json'
 echo
 echo "=========================================="
 if systemctl is-active --quiet pw-panel; then echo " ✅ PassWall 面板已运行"; else echo " ❌ 启动失败，查看：journalctl -u pw-panel -n 30"; fi
+echo " 版本： ${REF:0:7}"
 echo " 地址： http://$IP:$PORT"
 echo " 账号： $USER_"
 echo " 密码： $PW"
