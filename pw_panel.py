@@ -211,6 +211,7 @@ class Router:
                 break
         if not vals:
             raise Err("读不到 PassWall 配置（没装 PassWall，或系统不允许读取）" + (f"：{last}" if last else ""))
+        self._vals = vals
         glob = next((x for x in vals.values() if x.get(".type") == "global"), {})
         nodes = []
         for sid, x in vals.items():
@@ -424,6 +425,41 @@ class Router:
             if "ssid" in vals and now.get(sid, {}).get("ssid") != vals["ssid"]:
                 raise Err("保存后回读发现没改上（可能被盒子自动回滚了），请重试")
         return len(todo)
+
+    def node_refs(self, nid):
+        """找出 PassWall 配置里所有引用了这个节点的地方"""
+        self.load_config()
+        names = {k: (v.get("remarks") or k) for k, v in self._vals.items() if v.get(".type") == "nodes"}
+        typ_cn = {"global": "主设置", "nodes": "节点", "socks": "Socks 配置", "haproxy_config": "负载均衡",
+                  "acl_rule": "访问控制", "shunt_rules": "分流规则"}
+        refs = []
+        for sid, v in self._vals.items():
+            if sid == nid:
+                continue
+            for k, val in v.items():
+                if k.startswith("."):
+                    continue
+                vs = val if isinstance(val, list) else [val]
+                if any(str(x) == nid or str(x).startswith(nid + ":") for x in vs):
+                    t = v.get(".type", "")
+                    where = typ_cn.get(t, t)
+                    if t == "nodes":
+                        where += f"「{names.get(sid, sid)}」"
+                    if t == "global":
+                        where += {"tcp_node": "的 TCP 节点", "udp_node": "的 UDP 节点", "node": "的当前节点"}.get(k, f"（{k}）")
+                    refs.append(where)
+        return list(dict.fromkeys(refs))
+
+    def delete_node(self, nid):
+        n = self.node(nid)
+        refs = self.node_refs(nid)
+        if refs:
+            raise Err(f"「{n['remarks']}」正在被使用，不能删：" + "、".join(refs) + "。先换成别的节点再删。")
+        self.ubus("uci", "delete", {"config": self.app, "section": nid})
+        self.uci_save(self.app)
+        if any(x["id"] == nid for x in self.load_config()["nodes"]):
+            raise Err("删除没生效，请到后台手动删除")
+        return n["remarks"]
 
     def node(self, nid):
         for n in (self.cfg or self.load_config())["nodes"]:
@@ -808,6 +844,18 @@ def api_nodes(b):
     return {k: cfg[k] for k in ("app", "enabled", "current", "nodes", "has_udp", "udp", "mode")}
 
 
+def api_del_node(b):
+    c = client_for(b)
+    ids = b.get("nodes") or ([b["node"]] if b.get("node") else [])
+    done, fail = [], []
+    for nid in ids:
+        try:
+            done.append(c.delete_node(nid))
+        except Err as e:
+            fail.append(str(e))
+    return {"deleted": done, "failed": fail}
+
+
 def api_pw_set(b):
     r = get_router(b["id"])
     c = client_for(b)
@@ -1054,7 +1102,7 @@ def api_test_notify(_):
 
 POST_ROUTES = {
     "/api/check": api_check, "/api/nodes": api_nodes, "/api/test_node": api_test_node,
-    "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart, "/api/pw_set": api_pw_set, "/api/wifi": api_wifi, "/api/wifi/save": api_wifi_save,
+    "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart, "/api/pw_set": api_pw_set, "/api/del_node": api_del_node, "/api/wifi": api_wifi, "/api/wifi/save": api_wifi_save,
     "/api/router/save": api_router_save, "/api/router/delete": api_router_delete,
     "/api/frps/scan": api_frps_scan, "/api/router/bulk_add": api_bulk_add,
     "/api/settings/save": api_settings_save, "/api/settings/test_notify": api_test_notify,
@@ -1237,11 +1285,16 @@ function renderNodes(){if(!NODES)return;const d=NODES;
   return `<tr class="${c?"cur":""}"><td>${c?'<span class="tag">当前</span> ':""}${esc(n.remarks)}</td><td class="hide-m muted small">${esc(n.type)} ${esc(n.protocol)}</td>
   <td class="hide-m muted small">${esc(n.address)}${n.port?":"+esc(n.port):""}</td>
   <td id="lat-${n.id}">${t===undefined?'<span class="off">—</span>':t==="…"?"测速中…":t.ok?`<span class="ok">${t.ms}ms</span> <span class="muted small">${esc(t.kind)}</span>`:t.ok===null?`<span class="off">${esc(t.kind)}</span>`:'<span class="bad">不通</span>'}</td>
-  <td><div class="ops"><button class="sm" onclick="testNode('${n.id}')">测速</button>${c?"":`<button class="sm pri" onclick="switchNode('${n.id}',this)">切换</button>`}</div></td></tr>`}).join("")+
+  <td><div class="ops"><button class="sm" onclick="testNode('${n.id}')">测速</button>${c?"":`<button class="sm pri" onclick="switchNode('${n.id}',this)">切换</button>`}
+  ${c||n.id===d.udp?"":`<button class="sm danger" onclick="delNode('${n.id}',this)">删除</button>`}</div></td></tr>`}).join("")+
  `</tbody></table><div style="margin-top:16px"><b>添加新节点</b><div class="muted small">粘贴节点（可多行，一行一个）：分享链接 ss:// vmess:// vless:// trojan:// hy2:// …，或 SOCKS5 写法 <b>地址:端口:用户名:密码</b>（会建成 Xray 的 socks 节点）</div>
  <textarea id="link" rows="3" style="width:100%;margin-top:6px"></textarea>
  <div style="display:flex;gap:10px;align-items:center;margin-top:6px"><label><input type="checkbox" id="sw" checked> 添加后立即切换过去</label>
  <button class="pri" style="margin-left:auto" onclick="addLink(this)">添加节点</button></div></div>`}
+async function delNode(nid,btn){const n=NODES.nodes.find(x=>x.id===nid);if(!await ask(`删除节点「${n.remarks}」？\n删除后无法恢复，要用的话得重新添加。`))return;
+ btn.disabled=true;btn.textContent="删除中…";const id=NODES.id;
+ try{const r=await api("/api/del_node",{id,node:nid});if(r.failed.length)toast(r.failed.join("；"),8000);else toast("已删除："+r.deleted.join("、"));openNodes(id)}
+ catch(e){toast(e.message,6000);btn.disabled=false;btn.textContent="删除"}}
 async function testNode(nid){if(!NODES)return;const id=NODES.id;NODES.lat[nid]="…";renderNodes();
  try{const t=(await api("/api/test_node",{id,node:nid})).t;if(NODES&&NODES.id===id){NODES.lat[nid]=t;renderNodes()}}catch(e){if(NODES){NODES.lat[nid]={ok:false};renderNodes()}toast(e.message)}}
 async function testAll(btn){btn.disabled=true;for(const n of [...NODES.nodes]){if(!NODES)break;await testNode(n.id)}if(btn)btn.disabled=false}
