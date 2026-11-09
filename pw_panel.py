@@ -238,7 +238,9 @@ class Router:
         "gfw": {"use_gfw_list": "1", "chn_list": "0", "tcp_proxy_mode": "disable", "udp_proxy_mode": "disable"},
         "chnroute": {"use_gfw_list": "1", "chn_list": "direct", "tcp_proxy_mode": "proxy", "udp_proxy_mode": "proxy"},
         "returnhome": {"use_gfw_list": "0", "chn_list": "proxy", "tcp_proxy_mode": "disable", "udp_proxy_mode": "disable"},
-        "global": {"use_gfw_list": "0", "chn_list": "0", "tcp_proxy_mode": "proxy", "udp_proxy_mode": "proxy"},
+        # 全局代理：按你的习惯，同时关直连列表、开代理列表和屏蔽列表
+        "global": {"use_direct_list": "0", "use_proxy_list": "1", "use_block_list": "1", "use_gfw_list": "0",
+                   "chn_list": "0", "tcp_proxy_mode": "proxy", "udp_proxy_mode": "proxy"},
     }
     OLD_MODES = {"gfw": "gfwlist", "chnroute": "chnroute", "returnhome": "returnhome", "global": "global"}
 
@@ -246,9 +248,9 @@ class Router:
     def _mode_name(cls, g, old_scheme):
         if old_scheme:
             return {v: k for k, v in cls.OLD_MODES.items()}.get(g.get("tcp_proxy_mode"), "")
-        cur = {k: g.get(k, "") for k in ("use_gfw_list", "chn_list", "tcp_proxy_mode", "udp_proxy_mode")}
-        for name, vals in cls.MODES.items():
-            if all(cur[k] == v for k, v in vals.items() if k != "udp_proxy_mode"):
+        for name in ("global", "gfw", "chnroute", "returnhome"):
+            vals = cls.MODES[name]
+            if all(g.get(k, "") == v for k, v in vals.items() if k != "udp_proxy_mode"):
                 return name
         return "custom"
 
@@ -274,6 +276,8 @@ class Router:
                 raise Err("未知模式")
             if cfg["old_scheme"]:
                 vals["tcp_proxy_mode"] = vals["udp_proxy_mode"] = self.OLD_MODES[mode]
+                if mode == "global":
+                    vals.update(use_direct_list="0", use_proxy_list="1", use_block_list="1")
             else:
                 vals.update(self.MODES[mode])
         if not vals:
@@ -1210,6 +1214,7 @@ async function checkOne(id,btn){btn.disabled=true;btn.textContent="…";try{S=aw
 const R=id=>S.routers.find(r=>r.id===id);
 async function openNodes(id){openM(R(id).name+" · 节点",'<p class="muted">正在登录后台读取节点…</p>');
  try{const d=await api("/api/nodes",{id});NODES={id,...d,lat:{}};renderNodes()}catch(e){$("mb").innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
+const GTIP="直连列表关、代理列表开、屏蔽列表开、GFW 列表关、中国列表关闭、TCP/UDP 默认代理";
 const MODES=[["gfw","GFW 列表"],["chnroute","中国列表以外"],["returnhome","中国列表"],["global","全局代理"]];
 function nodeOpts(d,sel,extra){return (extra||[]).map(([v,t])=>`<option value="${v}" ${v===sel?"selected":""}>${t}</option>`).join("")+
  d.nodes.map(n=>`<option value="${esc(n.id)}" ${n.id===sel?"selected":""}>${esc(n.remarks)}${n.protocol?" ["+esc(n.protocol)+"]":""}</option>`).join("")}
@@ -1223,7 +1228,7 @@ function renderNodes(){if(!NODES)return;const d=NODES;
   ${d.has_udp?`<b style="margin-left:8px">UDP 节点</b><select id="selUdp">${nodeOpts(d,d.udp||"nil",[["nil","关闭"],["tcp","与 TCP 节点相同"]])}</select>`:""}
   <button class="sm pri" onclick="saveNodesSel(this)">保存</button></div>
  <div class="pwrow"><b>代理模式</b><span class="muted small">当前：${esc(curMode)}</span>
-  ${MODES.map(([k,t])=>`<button class="sm ${d.mode===k?"pri":""}" onclick="pwSet({mode:'${k}'},'切换到「${t}」模式？',this)">${t}</button>`).join("")}</div>
+  ${MODES.map(([k,t])=>`<button class="sm ${d.mode===k?"pri":""}" ${k==="global"?`title="${GTIP}"`:""} onclick="pwSet({mode:'${k}'},'切换到「${t}」模式？'+('${k}'==='global'?'\\n（${GTIP}）':''),this)">${t}</button>`).join("")}</div>
  </div>
  <div style="display:flex;gap:8px;align-items:center;margin:14px 0 8px"><b>节点列表</b><span class="muted small">${d.nodes.length} 个</span>
  <button class="sm" style="margin-left:auto" onclick="testAll(this)">全部测速</button></div>
