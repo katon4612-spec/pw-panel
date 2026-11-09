@@ -259,6 +259,35 @@ class Router:
                         "disabled": v.get("disabled") == "1" or d.get("disabled", False)})
         return out
 
+    def uci_save(self, config):
+        """提交 uci 改动。返回 True 表示走了 apply（服务会自动重载），False 表示走了 commit（需要自己重载）"""
+        try:
+            self.ubus("uci", "apply", {"rollback": True, "timeout": 60}, timeout=40)
+        except Err as e:
+            if "Access denied" in str(e) or "代码 6" in str(e):
+                # 老系统没有 apply 权限时才试 commit
+                try:
+                    self.ubus("uci", "commit", {"config": config})
+                    return False
+                except Err:
+                    raise Err("这台盒子的后台账号没有保存配置的权限（apply/commit 都被拒绝）")
+            raise
+        except NETERR:
+            pass  # apply 会重载服务，连接被断开是正常的，下面接着确认
+        last = None
+        for _ in range(8):
+            time.sleep(2)
+            try:
+                self.ubus("uci", "confirm", {}, timeout=15)
+                return True
+            except Err as e:
+                last = e
+                if "代码 5" in str(e) or "代码 9" in str(e):
+                    return True  # 没有待确认的回滚 = 已经生效
+            except NETERR as e:
+                last = e
+        raise Err(f"改动已下发但没确认成功（{last}），盒子会在 60 秒内自动恢复原设置，请稍后重试")
+
     def wifi_detail(self):
         """读每个 WiFi 的完整信息（含密码），给编辑用"""
         try:
@@ -314,14 +343,23 @@ class Router:
             return 0
         for sid, vals in todo:
             self.ubus("uci", "set", {"config": "wireless", "section": sid, "values": vals})
-        self.ubus("uci", "commit", {"config": "wireless"})
-        try:
-            self.ubus("network", "reload", {}, timeout=30)
-        except Err:
+        if not self.uci_save("wireless"):
             try:
-                self.ubus("file", "exec", {"command": "/sbin/wifi", "params": ["reload"]}, timeout=40)
+                self.ubus("network", "reload", {}, timeout=30)
             except Err:
-                raise Err("已保存，但无线没能自动重载，重启一下盒子才会生效")
+                try:
+                    self.ubus("file", "exec", {"command": "/sbin/wifi", "params": ["reload"]}, timeout=40)
+                except Err:
+                    raise Err("已保存，但无线没能自动重载，重启一下盒子才会生效")
+        # 回读确认真的改上了
+        time.sleep(3)
+        try:
+            now = {x["id"]: x for x in self.wifi_detail()}
+        except NETERR:
+            return len(todo)
+        for sid, vals in todo:
+            if "ssid" in vals and now.get(sid, {}).get("ssid") != vals["ssid"]:
+                raise Err("保存后回读发现没改上（可能被盒子自动回滚了），请重试")
         return len(todo)
 
     def node(self, nid):
@@ -416,7 +454,7 @@ class Router:
         if not done:
             self.ubus("uci", "set", {"config": self.app, "section": cfg["global_section"],
                                      "values": {cfg["opt"]: nid}})
-            self.ubus("uci", "commit", {"config": self.app})
+            self.uci_save(self.app)
             try:
                 self.ubus("rc", "init", {"name": self.app, "action": "restart"}, timeout=60)
             except Err:
@@ -978,7 +1016,9 @@ tr:last-child td{border-bottom:0}th,td:first-child,.nw{white-space:nowrap}.muted
 <button onclick="editRouter()">添加盒子</button><button onclick="openSettings()">设置</button></div></header>
 <main><div class="muted small" id="meta" style="margin-bottom:8px"></div><div id="list"></div></main>
 <div id="modal" class="modal" hidden onclick="if(event.target===this)closeM()"><div class="box"><div class="mh"><b id="mt"></b><button onclick="closeM()">×</button></div><div class="mb" id="mb"></div></div></div>
-<div id="toast"></div>
+<div id="ask" class="modal" hidden style="z-index:15;align-items:center"><div class="box" style="width:min(460px,100%)"><div class="mb">
+<div id="askT" style="white-space:pre-wrap;line-height:1.7"></div><div style="display:flex;gap:8px;justify-content:flex-end;margin-top:16px">
+<button id="askN">取消</button><button class="pri" id="askY">确定</button></div></div></div></div><div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -987,6 +1027,8 @@ const ORD={node_bad:0,dns_bad:0.5,error:1,no_wan:2,disabled:3,offline:4,none:5,o
 let S={routers:[]},FILTER=null,NODES=null;
 async function api(p,b){const o=b===undefined?{}:{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)};
  const r=await fetch(p,o);const j=await r.json();if(b!==undefined&&!j.ok)throw new Error(j.error||"失败");return j}
+function ask(t){return new Promise(res=>{$("askT").textContent=t;$("ask").hidden=false;const done=v=>{$("ask").hidden=true;res(v)};
+ $("askY").onclick=()=>done(true);$("askN").onclick=()=>done(false);$("askY").focus()})}
 function toast(t,ms=3000){const e=$("toast");e.textContent=t;e.classList.add("show");clearTimeout(e._t);e._t=setTimeout(()=>e.classList.remove("show"),ms)}
 function openM(t,h){$("mt").textContent=t;$("mb").innerHTML=h;$("modal").hidden=false}
 function closeM(){$("modal").hidden=true;NODES=null;WIFI=null}
@@ -1039,7 +1081,7 @@ function renderNodes(){if(!NODES)return;const d=NODES;
 async function testNode(nid){if(!NODES)return;const id=NODES.id;NODES.lat[nid]="…";renderNodes();
  try{const t=(await api("/api/test_node",{id,node:nid})).t;if(NODES&&NODES.id===id){NODES.lat[nid]=t;renderNodes()}}catch(e){if(NODES){NODES.lat[nid]={ok:false};renderNodes()}toast(e.message)}}
 async function testAll(btn){btn.disabled=true;for(const n of [...NODES.nodes]){if(!NODES)break;await testNode(n.id)}if(btn)btn.disabled=false}
-async function switchNode(nid,btn){const n=NODES.nodes.find(x=>x.id===nid);if(!confirm(`切换到「${n.remarks}」？PassWall 会重启，客户会断网 10~30 秒。`))return;
+async function switchNode(nid,btn){const n=NODES.nodes.find(x=>x.id===nid);if(!await ask(`切换到「${n.remarks}」？PassWall 会重启，客户会断网 10~30 秒。`))return;
  btn.disabled=true;btn.textContent="切换中…";const id=NODES.id;
  try{const r=await api("/api/switch",{id,node:nid});const g=r.status&&r.status.google;toast(g&&g.ok?`已切换，外网正常 ${g.ms}ms`:"已切换，但外网还是不通",5000);await load();if(NODES)openNodes(id)}
  catch(e){toast(e.message,5000);btn.disabled=false;btn.textContent="切换"}}
@@ -1059,19 +1101,20 @@ function renderWifi(){const d=WIFI;
  <td><input type="checkbox" id="wd${i}" ${w.disabled?"":"checked"}></td></tr>`).join("")+
  `</tbody></table><div style="display:flex;gap:10px;align-items:center;margin-top:12px">
  ${d.items.length>1?'<button onclick="wifiSync()">把第一行的名字和密码同步到全部</button>':""}
- <button class="pri" style="margin-left:auto" id="wsave" onclick="saveWifi()">保存</button></div>`}
-function wifiSync(){WIFI.items.forEach((w,i)=>{if(i){$("ws"+i).value=$("ws0").value;$("wk"+i).value=$("wk0").value}});toast("已填好，确认后点保存")}
+ <span id="wmsg" class="small" style="margin-left:auto"></span><button class="pri" id="wsave" onclick="saveWifi()">保存</button></div>`}
+function wmsg(t,c){const e=$("wmsg");if(e){e.textContent=t;e.className="small "+(c||"muted")}}
+function wifiSync(){wmsg("已填好，确认后点保存");WIFI.items.forEach((w,i)=>{if(i){$("ws"+i).value=$("ws0").value;$("wk"+i).value=$("wk0").value}})}
 async function saveWifi(){const ch=[],msg=[];
  WIFI.items.forEach((w,i)=>{const s=$("ws"+i).value.trim(),k=$("wk"+i).value,on=$("wd"+i).checked;
   if(s!==w.ssid||k!==w.key||on===w.disabled){ch.push({id:w.id,ssid:s,key:k,disabled:!on});
    msg.push(`${w.band||""} ${w.ssid}${s!==w.ssid?" → 名字改为「"+s+"」":""}${k!==w.key?(k?" → 改密码":" → 去掉密码"):""}${on===w.disabled?(on?" → 开启":" → 关闭"):""}`)}});
- if(!ch.length)return toast("没有改动");
- if(ch.some(c=>c.key&&c.key.length<8))return toast("WiFi 密码至少 8 位");
- if(!confirm("确认修改：\n"+msg.join("\n")+"\n\n保存后无线会重启，客户设备会断开几秒。"))return;
- const b=$("wsave");b.disabled=true;b.textContent="保存中…";
+ if(!ch.length)return wmsg("没有改动：先改名字或密码，再点保存","warn");
+ if(ch.some(c=>c.key&&c.key.length<8))return wmsg("WiFi 密码至少 8 位","bad");
+ if(!await ask("确认修改：\n"+msg.join("\n")+"\n\n保存后无线会重启，客户设备会断开几秒。"))return;
+ const b=$("wsave");b.disabled=true;b.textContent="保存中…";wmsg("正在保存并重启无线，约 10~30 秒…");
  try{const r=await api("/api/wifi/save",{id:WIFI.id,changes:ch});toast(r.changed===-1?"已提交，无线正在重启":"已保存，无线已重启生效",5000);await load();if(WIFI)openWifi(WIFI.id)}
- catch(e){toast(e.message,6000);b.disabled=false;b.textContent="保存"}}
-async function restartPW(id,btn){if(!confirm(`重启「${R(id).name}」的 PassWall？客户会断网十几秒。`))return;
+ catch(e){wmsg(e.message,"bad");b.disabled=false;b.textContent="保存"}}
+async function restartPW(id,btn){if(!await ask(`重启「${R(id).name}」的 PassWall？客户会断网十几秒。`))return;
  const t=btn?btn.textContent:"";if(btn){btn.disabled=true;btn.textContent="重启中…"}
  try{const r=await api("/api/restart",{id});const st=r.status||{};toast(st.level==="ok"?"重启完成，已恢复正常":"重启完成，当前状态："+(LV[st.level]||["?"])[0],5000);await load();if(NODES&&NODES.id===id)openNodes(id)}
  catch(e){toast(e.message,5000)}finally{if(btn){btn.disabled=false;btn.textContent=t}}}
@@ -1093,7 +1136,7 @@ function editRouter(id){const r=id?R(id):{};
 async function saveRouter(id){const b={id:id||undefined,name:$("f_name").value,note:$("f_note").value,port:$("f_port").value,host:$("f_host").value,
  user:$("f_user").value,password:$("f_pw").value,frp_name:$("f_frp").value,https:$("f_https").checked,clear_password:$("f_clr")?$("f_clr").checked:false};
  try{const r=await api("/api/router/save",b);closeM();await load();toast("已保存，正在检测…");S=await api("/api/check",{id:r.id});render()}catch(e){toast(e.message)}}
-async function delRouter(id){if(!confirm("确定删除这个盒子？（只是从面板移除，不影响路由器）"))return;try{await api("/api/router/delete",{id});closeM();load()}catch(e){toast(e.message)}}
+async function delRouter(id){if(!await ask("确定删除这个盒子？（只是从面板移除，不影响路由器）"))return;try{await api("/api/router/delete",{id});closeM();load()}catch(e){toast(e.message)}}
 async function openImport(){openM("从 frps 导入",'<p class="muted">正在读取 frps 代理列表，并探测哪些端口是软路由后台…</p>');
  try{const r=await api("/api/frps/scan",{});if(!r.items.length){$("mb").innerHTML='<p class="muted">frps 里没有 TCP 代理。</p>';return}
  $("mb").innerHTML=`<p class="muted small">已勾选「像软路由后台」且还没加过的。导入后用设置里的默认后台密码登录；个别密码不同的，导入后点「编辑」单独填。</p>
