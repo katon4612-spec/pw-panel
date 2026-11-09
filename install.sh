@@ -19,6 +19,7 @@ REF="${SHA:-main}"
 curl -fsSL "https://raw.githubusercontent.com/$REPO/$REF/pw_panel.py?t=$(date +%s)" -o "$DIR/pw_panel.py.new"
 echo "版本：${REF:0:7}"
 python3 -m py_compile "$DIR/pw_panel.py.new" && mv "$DIR/pw_panel.py.new" "$DIR/pw_panel.py"
+[ -n "$SHA" ] && echo "$SHA" > "$DIR/VERSION"
 
 cat > /etc/systemd/system/pw-panel.service <<SVC
 [Unit]

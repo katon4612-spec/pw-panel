@@ -10,7 +10,7 @@ PassWall 节点状态面板（单文件，只用 Python 自带库，无需安装
       读 PassWall 配置（当前节点、节点列表）→ 调 PassWall 自带的检测接口测谷歌/百度 →
       需要时切换节点或用分享链接添加节点。路由器上不用装任何东西。
 """
-import base64, http.client, json, os, re, secrets, socket, ssl, sys, threading, time, traceback
+import base64, http.client, ipaddress, json, os, re, secrets, socket, ssl, sys, threading, time, traceback
 import urllib.parse, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -48,6 +48,10 @@ DEFAULT_CONFIG = {
     "test_url": "https://www.google.com/generate_204",
     "notify_webhook": "",
     "telegram": {"bot_token": "", "chat_id": ""},
+    "allow_ips": "",          # 只允许这些 IP 访问面板（逗号分隔，支持 1.2.3.0/24），留空 = 不限制
+    "auto_import": True,      # frps 出现新的软路由后台端口时自动加入
+    "ignored_frp": [],        # 删除过的盒子（frp 代理名或端口），自动导入时跳过
+    "update_repo": "katon4612-spec/pw-panel",
     "routers": [],
 }
 
@@ -964,10 +968,11 @@ def bg_loop():
     time.sleep(3)
     restore_auto_log()
     while True:
-        try:
-            expiry_notify_daily()
-        except Exception:
-            traceback.print_exc()
+        for job in (expiry_notify_daily, auto_import_new):
+            try:
+                job()
+            except Exception:
+                traceback.print_exc()
         iv = int(CFG.get("check_interval_min") or 0)
         if iv > 0 and not LAST_FULL["running"]:
             LAST_FULL["running"] = True
@@ -1300,6 +1305,7 @@ def api_router_save(b):
         if b.get("id"):
             r = get_router(b["id"])
             r.update(fields)
+            r.pop("new", None)
             if b.get("password"):
                 r["password"] = b["password"]
             if b.get("clear_password"):
@@ -1322,6 +1328,12 @@ def api_auto(b):
 
 def api_router_delete(b):
     with LOCK:
+        r = next((x for x in CFG["routers"] if x["id"] == b["id"]), None)
+        if r:
+            ign = CFG.setdefault("ignored_frp", [])
+            for k in (r.get("frp_name"), str(r.get("port"))):
+                if k and k not in ign:
+                    ign.append(k)
         CFG["routers"] = [r for r in CFG["routers"] if r["id"] != b["id"]]
         STATUS.pop(b["id"], None)
         save_cfg(CFG)
@@ -1353,6 +1365,11 @@ def api_frps_scan(_):
 def api_bulk_add(b):
     n = 0
     with LOCK:
+        ign = CFG.setdefault("ignored_frp", [])
+        for it in b.get("items") or []:
+            for k in (it.get("name"), str(it.get("port"))):
+                if k in ign:
+                    ign.remove(k)
         for it in b.get("items") or []:
             if not str(it.get("port", "")).isdigit():
                 continue
@@ -1368,6 +1385,10 @@ SECRET_KEYS = ("panel_password", "default_luci_password")
 
 
 def api_settings_get(_=None):
+    return {**_settings_get(), "version": cur_version()[:7]}
+
+
+def _settings_get():
     s = {k: v for k, v in CFG.items() if k != "routers"}
     s = json.loads(json.dumps(s))
     for k in SECRET_KEYS:
@@ -1393,8 +1414,145 @@ def api_settings_save(b):
             CFG["frps"]["password"] = f["password"]
         tg = b.get("telegram") or {}
         CFG["telegram"] = {"bot_token": str(tg.get("bot_token", "")).strip(), "chat_id": str(tg.get("chat_id", "")).strip()}
+        if "auto_import" in b:
+            CFG["auto_import"] = bool(b["auto_import"])
+        if "allow_ips" in b:
+            rules = [x.strip() for x in str(b["allow_ips"]).replace("，", ",").replace("\n", ",").split(",") if x.strip()]
+            for x in rules:
+                try:
+                    ipaddress.ip_network(x, strict=False)
+                except ValueError:
+                    raise Err(f"白名单里「{x}」不是有效的 IP 或网段")
+            old = CFG.get("allow_ips", "")
+            CFG["allow_ips"] = ", ".join(rules)
+            me = b.get("_ip", "")
+            if rules and not ip_allowed(me):
+                CFG["allow_ips"] = old
+                raise Err(f"白名单里没有你现在的 IP（{me}），保存后你自己就进不来了。请把它加进去")
         save_cfg(CFG)
     return {}
+
+
+# ---------------------------------------------------------------- 备份恢复
+def api_restore(b):
+    c = b.get("config")
+    if not isinstance(c, dict) or not isinstance(c.get("routers"), list):
+        raise Err("这不是面板的备份文件")
+    for r in c["routers"]:
+        if not isinstance(r, dict) or "id" not in r or "port" not in r:
+            raise Err("备份文件里的盒子数据不完整")
+    with LOCK:
+        keep = {k: CFG[k] for k in ("listen_host", "listen_port")}
+        CFG.clear()
+        CFG.update(json.loads(json.dumps(DEFAULT_CONFIG)))
+        CFG.update(c)
+        CFG.update(keep)
+        if not CFG.get("panel_password"):
+            CFG["panel_password"] = secrets.token_urlsafe(9)
+        save_cfg(CFG)
+        STATUS.clear()
+    hist(None, "security", f"从备份恢复配置（{len(CFG['routers'])} 台盒子）", ok=True)
+    return {"count": len(CFG["routers"])}
+
+
+# ---------------------------------------------------------------- 在线更新
+VERSION_PATH = os.path.join(BASE, "VERSION")
+
+
+def cur_version():
+    try:
+        with open(VERSION_PATH) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def gh_get(url, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent": "pw-panel", "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def api_update_check(_):
+    repo = CFG.get("update_repo") or DEFAULT_CONFIG["update_repo"]
+    try:
+        j = json.loads(gh_get(f"https://api.github.com/repos/{repo}/commits/main"))
+    except Exception as e:
+        raise Err(f"连不上 GitHub：{e}")
+    sha = j.get("sha", "")
+    cur = cur_version()
+    return {"current": cur[:7] or "未知", "latest": sha[:7], "latest_full": sha,
+            "message": (j.get("commit", {}).get("message") or "").split("\n")[0],
+            "date": (j.get("commit", {}).get("committer", {}).get("date") or "")[:10],
+            "has_update": bool(sha) and sha != cur}
+
+
+def api_update_do(b):
+    info = api_update_check(b)
+    sha = info["latest_full"]
+    if not sha:
+        raise Err("没拿到最新版本号")
+    repo = CFG.get("update_repo") or DEFAULT_CONFIG["update_repo"]
+    try:
+        code = gh_get(f"https://raw.githubusercontent.com/{repo}/{sha}/pw_panel.py", timeout=30)
+    except Exception as e:
+        raise Err(f"下载新版本失败：{e}")
+    try:
+        compile(code, "pw_panel.py", "exec")
+    except SyntaxError as e:
+        raise Err(f"新版本文件有问题，没有更新：{e}")
+    me = os.path.abspath(__file__)
+    with open(me + ".new", "wb") as f:
+        f.write(code)
+    os.replace(me, me + ".bak")
+    os.replace(me + ".new", me)
+    with open(VERSION_PATH, "w") as f:
+        f.write(sha)
+    hist(None, "security", f"面板更新：{info['current']} → {sha[:7]}（{info['message']}）", ok=True)
+
+    def restart():
+        time.sleep(1.5)
+        os.execv(sys.executable, [sys.executable, me] + sys.argv[1:])
+    threading.Thread(target=restart, daemon=True).start()
+    return {"version": sha[:7]}
+
+
+# ---------------------------------------------------------------- frps 新盒子自动加入
+def auto_import_new():
+    if not CFG.get("auto_import", True) or not (CFG.get("frps") or {}).get("url"):
+        return
+    try:
+        lst = frps_fetch()
+    except Exception:
+        return
+    have_ports = {str(r["port"]) for r in CFG["routers"]}
+    have_names = {r.get("frp_name") for r in CFG["routers"] if r.get("frp_name")}
+    ignored = set(str(x) for x in CFG.get("ignored_frp") or [])
+    cands = [p for p in lst if p["type"] == "tcp" and p["port"] and p["online"]
+             and str(p["port"]) not in have_ports and p["name"] not in have_names
+             and str(p["port"]) not in ignored and p["name"] not in ignored]
+    if not cands:
+        return
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        probes = list(ex.map(lambda p: probe_luci(p["port"]), cands))
+    added = []
+    with LOCK:
+        for p, ok in zip(cands, probes):
+            if not ok:
+                continue
+            r = {"id": secrets.token_hex(4), "name": p["name"] or f"盒子-{p['port']}", "port": int(p["port"]),
+                 "host": "", "user": "", "password": "", "note": "", "frp_name": p["name"] or "",
+                 "https": False, "new": True}
+            CFG["routers"].append(r)
+            added.append(r)
+        if added:
+            save_cfg(CFG)
+    for r in added:
+        hist(r, "status", f"frps 出现新盒子（端口 {r['port']}），已自动加入面板", ok=True)
+    if added:
+        notify("PassWall 面板 · 发现新盒子\n" + "\n".join(f"· {r['name']}（端口 {r['port']}）" for r in added)
+               + "\n已自动加入，记得到面板里改个名字")
+        check_many([r["id"] for r in added])
 
 
 def api_test_notify(_):
@@ -1406,10 +1564,32 @@ POST_ROUTES = {
     "/api/check": api_check, "/api/nodes": api_nodes, "/api/test_node": api_test_node,
     "/api/switch": api_switch, "/api/add_link": api_add_link, "/api/autofix": api_autofix, "/api/restart": api_restart, "/api/pw_set": api_pw_set, "/api/del_node": api_del_node, "/api/wifi": api_wifi, "/api/wifi/save": api_wifi_save,
     "/api/router/save": api_router_save, "/api/router/delete": api_router_delete, "/api/batch": api_batch, "/api/reboot": api_reboot,
-    "/api/history": api_history, "/api/router/auto": api_auto,
+    "/api/history": api_history, "/api/restore": api_restore,
+    "/api/update/check": api_update_check, "/api/update/do": api_update_do, "/api/router/auto": api_auto,
     "/api/frps/scan": api_frps_scan, "/api/router/bulk_add": api_bulk_add,
     "/api/settings/save": api_settings_save, "/api/settings/test_notify": api_test_notify,
 }
+
+
+LOGIN_FAILS = {}   # ip -> {"n": 次数, "first": 时间, "until": 锁定到}
+FAIL_MAX, FAIL_WINDOW, LOCK_SECS = 5, 600, 1800
+
+
+def ip_allowed(ip):
+    rules = [x.strip() for x in str(CFG.get("allow_ips") or "").replace("，", ",").split(",") if x.strip()]
+    if not rules or ip in ("127.0.0.1", "::1"):
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for rule in rules:
+        try:
+            if addr in ipaddress.ip_network(rule, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1419,11 +1599,41 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _deny(self, code, text):
+        body = f"<!doctype html><meta charset=utf-8><body style='font:16px sans-serif;padding:40px;background:#F5F4EE;color:#1F1E1D'><h2>{text}</h2>".encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _auth(self):
+        ip = self.client_address[0]
+        if not ip_allowed(ip):
+            self._deny(403, f"这个 IP（{ip}）不在面板的访问白名单里")
+            return False
+        f = LOGIN_FAILS.get(ip)
+        now = time.time()
+        if f and f.get("until", 0) > now:
+            self._deny(403, f"密码错误次数太多，这个 IP 已被锁定，{int((f['until'] - now) / 60) + 1} 分钟后再试")
+            return False
         exp = "Basic " + base64.b64encode(f"{CFG['panel_user']}:{CFG['panel_password']}".encode()).decode()
         got = self.headers.get("Authorization", "")
         if secrets.compare_digest(got.encode("utf-8", "replace"), exp.encode()):
+            LOGIN_FAILS.pop(ip, None)
             return True
+        if got:  # 带了账号密码但不对，才算一次失败
+            if not f or now - f.get("first", 0) > FAIL_WINDOW:
+                f = {"n": 0, "first": now}
+            f["n"] += 1
+            if f["n"] >= FAIL_MAX:
+                f["until"] = now + LOCK_SECS
+                print(f"[安全] {ip} 密码连续错误 {FAIL_MAX} 次，已锁定 {LOCK_SECS // 60} 分钟")
+                hist(None, "security", f"{ip} 面板密码连续错误 {FAIL_MAX} 次，已锁定 {LOCK_SECS // 60} 分钟", ok=False)
+            LOGIN_FAILS[ip] = f
+            if f.get("until"):
+                self._deny(403, "密码错误次数太多，这个 IP 已被锁定 30 分钟")
+                return False
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="PassWall Panel", charset="UTF-8"')
         self.send_header("Content-Length", "0")
@@ -1451,7 +1661,18 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/state":
             return self._send(200, api_state())
         if p == "/api/settings":
-            return self._send(200, api_settings_get())
+            return self._send(200, {**api_settings_get(), "client_ip": self.client_address[0]})
+        if p == "/api/backup":
+            body = json.dumps(CFG, ensure_ascii=False, indent=2).encode("utf-8")
+            fn = time.strftime("pw_panel_backup_%Y%m%d_%H%M.json")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Disposition", f'attachment; filename="{fn}"')
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
@@ -1467,6 +1688,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"ok": False, "error": "not found"})
         try:
             b = json.loads(raw or b"{}")
+            if isinstance(b, dict):
+                b["_ip"] = self.client_address[0]
             res = fn(b) or {}
             self._send(200, {"ok": True, **res})
         except Err as e:
@@ -1663,7 +1886,7 @@ function render(){
  rs.map(r=>{const s=r.status||{},l=lvl(r),[lt,lc]=LV[l];
   return `<tr class="${SEL.has(r.id)?"sel":""}"><td class="ck"><input type="checkbox" ${SEL.has(r.id)?"checked":""} onclick="selOne('${r.id}',this.checked)"></td>
   <td class="c-st"><span class="pill p-${lc}"><i></i>${lt}</span></td>
-  <td class="c-name"><b>${esc(r.name)}</b>${r.auto_switch?' <span class="tag" title="已开启自动切换节点">自动</span>':""}${expBadge(r)}${r.note?` <span class="muted small">${esc(r.note)}</span>`:""}
+  <td class="c-name"><b>${esc(r.name)}</b>${r.new?' <span class="tag" style="background:#E8F3EC;color:#3B8A5A" title="frps 自动加入的新盒子，点「编辑」改个名字后标记消失">新</span>':""}${r.auto_switch?' <span class="tag" title="已开启自动切换节点">自动</span>':""}${expBadge(r)}${r.note?` <span class="muted small">${esc(r.note)}</span>`:""}
   ${r.auto_running?'<div class="small warn">⟳ 正在自动切换节点…</div>':(s.msg?`<div class="small ${lc}">${esc(s.msg)}</div>`:"")}
   ${r.auto_log&&Date.now()/1000-r.auto_log.time<86400?`<div class="small ${r.auto_log.fixed?"ok":"bad"}">⟳ ${ago(r.auto_log.time)}：${esc(r.auto_log.text)}</div>`:""}</td>
   <td data-l="WiFi">${wifiCell(s.wifi)}</td><td class="hide-m" data-l="端口">${esc(r.port)}</td><td class="hide-m nw" data-l="frp">${s.frp===true?'<span class="ok">在线</span>':s.frp===false?'<span class="bad">离线</span>':'<span class="off">—</span>'}</td>
@@ -1694,7 +1917,7 @@ function batchMode(){openM(`批量切换代理模式 · ${SEL.size} 台`,`<p cla
 async function openHist(id){const title=id?R(id).name+" · 记录":"全部记录";openM(title,'<p class="muted">读取中…</p>');
  try{const r=await api("/api/history",{id:id||"",limit:300});
   if(!r.items.length){$("mb").innerHTML='<p class="muted">还没有记录。状态变化、自动切换和你在面板上的操作都会记在这里。</p>';return}
-  const K={status:"状态",auto:"自动切换",switch:"切换节点",add:"添加节点",del:"删除节点",wifi:"WiFi",set:"PassWall 设置",restart:"重启PassWall",reboot:"重启盒子",fix:"一键修复"};
+  const K={status:"状态",auto:"自动切换",switch:"切换节点",add:"添加节点",del:"删除节点",wifi:"WiFi",set:"PassWall 设置",restart:"重启PassWall",reboot:"重启盒子",fix:"一键修复",security:"系统/安全"};
   $("mb").innerHTML=`<div class="tl">${r.items.map(x=>`<div class="tli"><span class="tld ${x.ok===true?"bg-ok":x.ok===false?"bg-bad":"bg-off"}"></span>
    <div><div class="small muted">${new Date(x.t*1000).toLocaleString("zh-CN",{hour12:false})} · ${K[x.kind]||x.kind}${id?"":" · <b>"+esc(x.name)+"</b>"}</div><div>${esc(x.text)}</div></div></div>`).join("")}</div>`}
  catch(e){$("mb").innerHTML=`<p class="bad">${esc(e.message)}</p>`}}
@@ -1833,6 +2056,7 @@ async function openSettings(){const s=await api("/api/settings");const ph=x=>x?"
  openM("设置",`<div class="form"><div class="sec" style="border:0;padding:0;margin:0">frps 面板</div>
  <label>frps 面板地址</label><input id="s_fu" value="${esc(s.frps.url)}"><label>frps 用户名</label><input id="s_fn" value="${esc(s.frps.user)}">
  <label>frps 密码</label><input id="s_fp" type="password" placeholder="${ph(s.frps_password_set)}">
+ <label>新盒子自动加入</label><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="s_ai" ${s.auto_import!==false?"checked":""}> frps 里出现新的软路由后台端口时，自动加进面板并通知你</label>
  <div class="sec">软路由后台（默认值）</div><label>默认 IP</label><input id="s_rh" value="${esc(s.router_host)}">
  <label>默认用户名</label><input id="s_du" value="${esc(s.default_luci_user)}"><label>默认密码</label><input id="s_dp" type="password" placeholder="${ph(s.default_luci_password_set)}">
  <div class="sec">检测</div><label>自动检测间隔（分钟）</label><input id="s_iv" value="${esc(s.check_interval_min)}" placeholder="0 = 关闭">
@@ -1840,11 +2064,35 @@ async function openSettings(){const s=await api("/api/settings");const ph=x=>x?"
  <div class="sec">自动切换节点</div><label>全部盒子</label><div style="display:flex;gap:8px"><button type="button" onclick="autoAll(true)">全部开启</button><button type="button" onclick="autoAll(false)">全部关闭</button></div>
  <div class="sec">掉线通知（可选）</div><label>企业微信/钉钉机器人 Webhook</label><input id="s_wh" value="${esc(s.notify_webhook)}">
  <label>Telegram Bot Token</label><input id="s_tt" value="${esc(s.telegram.bot_token)}"><label>Telegram Chat ID</label><input id="s_tc" value="${esc(s.telegram.chat_id)}">
- <div class="sec">面板登录</div><label>面板用户名</label><input id="s_pu" value="${esc(s.panel_user)}"><label>新面板密码</label><input id="s_pp" type="password" placeholder="留空不改">
+ <div class="sec">面板登录与安全</div><label>面板用户名</label><input id="s_pu" value="${esc(s.panel_user)}"><label>新面板密码</label><input id="s_pp" type="password" placeholder="留空不改">
+ <label>访问白名单</label><div><input id="s_ip" value="${esc(s.allow_ips||"")}" placeholder="留空 = 不限制；例如 1.2.3.4, 5.6.7.0/24" style="width:100%">
+  <div class="muted small" style="margin-top:4px">你现在的 IP：<b>${esc(s.client_ip||"")}</b> <a href="javascript:void 0" onclick="const e=$('s_ip');e.value=(e.value?e.value+', ':'')+'${esc(s.client_ip||"")}'">加进去</a>。家里宽带 IP 会变的话慎用。密码连续错 5 次会锁定该 IP 30 分钟。</div></div>
+ <label>备份 / 恢复</label><div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"><a href="/api/backup" download><button type="button">⬇ 下载备份</button></a>
+  <button type="button" onclick="$('s_rf').click()">⬆ 从备份恢复</button><input type="file" id="s_rf" accept=".json,application/json" hidden onchange="restoreCfg(this)">
+  <span class="muted small">备份里有所有盒子的后台密码，请妥善保存</span></div>
+ <div class="sec">面板版本</div><label>当前版本</label><div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><b>${esc(s.version||"未知")}</b>
+  <button type="button" id="upBtn" onclick="checkUpdate()">检查更新</button><span id="upInfo" class="small muted"></span></div>
  <div class="full" style="display:flex;gap:8px;margin-top:6px"><button onclick="testNotify()">发送测试通知</button><button class="pri" style="margin-left:auto" onclick="saveSettings()">保存</button></div></div>`)}
+async function restoreCfg(inp){const f=inp.files[0];inp.value="";if(!f)return;let c;
+ try{c=JSON.parse(await f.text())}catch(e){return toast("读不了这个文件："+e.message)}
+ if(!c||!Array.isArray(c.routers))return toast("这不是面板的备份文件");
+ if(!await ask(`用这个备份覆盖当前配置？\n备份里有 ${c.routers.length} 台盒子。当前的盒子列表和设置都会被替换。`))return;
+ try{const r=await api("/api/restore",{config:c});toast(`已恢复 ${r.count} 台盒子。如果面板密码不同，请用备份里的密码重新登录`,6000);closeM();setTimeout(()=>location.reload(),1500)}catch(e){toast(e.message,6000)}}
+async function checkUpdate(){const b=$("upBtn"),info=$("upInfo");b.disabled=true;b.textContent="检查中…";
+ try{const r=await api("/api/update/check",{});
+  if(!r.has_update){info.innerHTML=`已经是最新版（${esc(r.latest)}）`;b.textContent="检查更新";b.disabled=false;return}
+  info.innerHTML=`有新版本 <b>${esc(r.latest)}</b>（${esc(r.date)}）：${esc(r.message)}`;b.textContent="立即更新";b.disabled=false;b.classList.add("pri");b.onclick=doUpdate}
+ catch(e){info.textContent=e.message;b.textContent="检查更新";b.disabled=false}}
+async function doUpdate(){if(!await ask("更新面板？更新时面板会重启，大约 5 秒后自动刷新。\n（只更新面板程序，不会动你的盒子和配置）"))return;
+ const b=$("upBtn");b.disabled=true;b.textContent="更新中…";
+ try{const r=await api("/api/update/do",{});$("upInfo").textContent=`已更新到 ${r.version}，正在重启面板…`;
+  for(let i=0;i<30;i++){await new Promise(z=>setTimeout(z,1500));try{const x=await fetch("/api/state");if(x.ok){location.reload();return}}catch(e){}}
+  $("upInfo").textContent="面板还没起来，请稍后手动刷新"}
+ catch(e){toast(e.message,6000);b.disabled=false;b.textContent="立即更新"}}
 async function saveSettings(){const b={frps:{url:$("s_fu").value,user:$("s_fn").value,password:$("s_fp").value},router_host:$("s_rh").value,default_luci_user:$("s_du").value,
  default_luci_password:$("s_dp").value,check_interval_min:$("s_iv").value,test_url:$("s_tu").value,notify_webhook:$("s_wh").value,
- telegram:{bot_token:$("s_tt").value,chat_id:$("s_tc").value},panel_user:$("s_pu").value,panel_password:$("s_pp").value};
+ telegram:{bot_token:$("s_tt").value,chat_id:$("s_tc").value},panel_user:$("s_pu").value,panel_password:$("s_pp").value,
+ allow_ips:$("s_ip").value,auto_import:$("s_ai").checked};
  try{await api("/api/settings/save",b);closeM();toast(b.panel_password?"已保存，面板密码已改，请重新登录":"已保存");load()}catch(e){toast(e.message)}}
 async function testNotify(){try{await api("/api/settings/save",{frps:{},telegram:{bot_token:$("s_tt").value,chat_id:$("s_tc").value},notify_webhook:$("s_wh").value});await api("/api/settings/test_notify",{});toast("已发送，去看看收到没")}catch(e){toast(e.message)}}
 load();setInterval(load,20000);
